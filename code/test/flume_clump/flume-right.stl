@@ -1,0 +1,30 @@
+solid Created by Gmsh
+facet normal -1 0 0
+  outer loop
+    vertex 7 0 0
+    vertex 7 0.3 0.3
+    vertex 7 0.6 0
+  endloop
+endfacet
+facet normal -1 0 0
+  outer loop
+    vertex 7 0 0.6
+    vertex 7 0.3 0.3
+    vertex 7 0 0
+  endloop
+endfacet
+facet normal -1 0 0
+  outer loop
+    vertex 7 0.6 0
+    vertex 7 0.3 0.3
+    vertex 7 0.6 0.6
+  endloop
+endfacet
+facet normal -1 -0 0
+  outer loop
+    vertex 7 0.6 0.6
+    vertex 7 0.3 0.3
+    vertex 7 0 0.6
+  endloop
+endfacet
+endsolid Created by Gmsh
