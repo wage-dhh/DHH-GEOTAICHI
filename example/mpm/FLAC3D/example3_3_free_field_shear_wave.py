@@ -104,6 +104,15 @@ INITIAL_TIMESTEP = 1.0
 # tau = rho * Vs * v and is useful when testing the MPM velocity-boundary path.
 LOADING_MODE = os.environ.get("EXAMPLE3_3_LOADING", "stress").lower()
 
+# Single-particle monitoring targets. The recorded value is taken from the
+# material point nearest each target coordinate, not from an averaged region.
+MONITOR_POINTS = {
+    "main_top": (MAIN_X0 + 2.0, DOMAIN_HEIGHT - 0.25),
+    "left_ff_top": (0.5 * FREE_FIELD_WIDTH, DOMAIN_HEIGHT - 0.25),
+    "right_ff_top": (MAIN_X0 + MAIN_WIDTH + 0.5 * FREE_FIELD_WIDTH, DOMAIN_HEIGHT - 0.25),
+    "base": (MAIN_X0 + 0.5 * MAIN_WIDTH, 0.25),
+}
+
 
 def elastic_constants_from_bulk_shear(bulk, shear):
     young = 9.0 * bulk * shear / (3.0 * bulk + shear)
@@ -233,17 +242,10 @@ def apply_dynamic_base_loading(model, time):
         raise ValueError("EXAMPLE3_3_LOADING must be 'stress' or 'velocity'")
 
 
-def mean_or_zero(values):
-    return float(values.mean()) if values.size else 0.0
-
-
-def mask_box(position, x0, x1, y0, y1):
-    return (
-        (position[:, 0] >= x0)
-        & (position[:, 0] <= x1)
-        & (position[:, 1] >= y0)
-        & (position[:, 1] <= y1)
-    )
+def nearest_particle_index(position, target):
+    target = np.array(target, dtype=float)
+    distance2 = np.sum((position[:, :2] - target) ** 2, axis=1)
+    return int(np.argmin(distance2))
 
 
 def collect_histories(model, rows, previous, forced=False):
@@ -260,14 +262,6 @@ def collect_histories(model, rows, previous, forced=False):
     velocity = model.scene.particle.v.to_numpy()[:particle_num]
     stress = model.scene.particle.stress.to_numpy()[:particle_num]
 
-    top_y0 = DOMAIN_HEIGHT - 0.5
-    masks = {
-        "main_top": mask_box(position, shifted_x(1.5), shifted_x(4.5), top_y0, 4.1),
-        "left_ff_top": mask_box(position, 0.0, FREE_FIELD_WIDTH, top_y0, 4.1),
-        "right_ff_top": mask_box(position, MAIN_X0 + MAIN_WIDTH, DOMAIN_WIDTH, top_y0, 4.1),
-        "base": mask_box(position, 0.0, DOMAIN_WIDTH, 0.0, 0.5),
-    }
-
     dt_hist = max(time - previous.get("_last_history_time", time), float(model.sims.delta))
     row = {
         "time": time,
@@ -275,11 +269,14 @@ def collect_histories(model, rows, previous, forced=False):
         "bottom_dstress": bottom_shear_stress(time),
         "bottom_impedance_velocity": bottom_impedance_velocity(time),
     }
-    for key, mask in masks.items():
-        vx = mean_or_zero(velocity[mask, 0])
-        vy = mean_or_zero(velocity[mask, 1])
-        tau_xy = mean_or_zero(stress[mask, 3]) if stress.size else 0.0
+    for key, target in MONITOR_POINTS.items():
+        point_id = nearest_particle_index(position, target)
+        vx = float(velocity[point_id, 0])
+        vy = float(velocity[point_id, 1])
+        tau_xy = float(stress[point_id, 3]) if stress.size else 0.0
         previous_vx = previous.get(f"{key}_vx", vx)
+        row[f"{key}_point_x"] = float(position[point_id, 0])
+        row[f"{key}_point_y"] = float(position[point_id, 1])
         row[f"{key}_vx"] = vx
         row[f"{key}_vy"] = vy
         row[f"{key}_ax"] = (vx - previous_vx) / dt_hist
