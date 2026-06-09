@@ -183,10 +183,11 @@ def kernel_read_particle_file_(particles: ti.template(), particleNum: int, parti
         particles[i]._set_essential(bodyID, materialID, density, particle_volume[np], vec3f(particle[np, 0], particle[np, 1], particle[np, 2]), v, fix_v)
 @ti.kernel
 def kernel_read_particle_file_2D(particles: ti.template(), particleNum: int, particle_num: int, particle: ti.types.ndarray(), particle_volume: ti.types.ndarray(), 
-                                 bodyID: int, materialID: int, density: float, init_v: ti.types.vector(2, float), fix_v: ti.types.vector(2, int)):
+                                 bodyID: int, materialID: int, density: float, init_v: ti.types.ndarray(), fix_v: ti.types.vector(2, int)):
     for np in range(particle_num):
         i = particleNum + np
-        particles[i]._set_essential(bodyID, materialID, density, particle_volume[np], vec2f(particle[np, 0], particle[np, 1]), init_v, fix_v)
+        v = vec2f(init_v[np, 0], init_v[np, 1])
+        particles[i]._set_essential(bodyID, materialID, density, particle_volume[np], vec2f(particle[np, 0], particle[np, 1]), v, fix_v)
 
 @ti.kernel
 def kernel_rebulid_particle(particle_number: int, particle: ti.template(), is_rigid: ti.template(), bodyID: ti.types.ndarray(), materialID: ti.types.ndarray(), active: ti.types.ndarray(),

@@ -50,9 +50,10 @@ class TractionConstraint:
     traction: float
 
     @ti.func
-    def set_boundary_condition(self, node, level, traction):
+    def set_boundary_condition(self, node, level, direction, traction):
         self.node = node
         self.level = ti.u8(level)
+        self.dirs = ti.cast(direction, ti.u8)
         self.traction += traction
 
     @ti.func
