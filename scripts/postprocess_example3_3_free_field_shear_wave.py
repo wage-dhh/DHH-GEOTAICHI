@@ -1,7 +1,7 @@
 ﻿"""Postprocess Kohler-style MPM shear-wave histories for FLAC3D Example 3.3 trend validation.
 
-Reads output/example3_3_flac3d_free_field_new/results/history_all_points.csv and writes
-Figure 3.9 trend-comparison figures plus equivalent-validation metrics.
+Reads the current two-point top-monitor history and writes Figure 3.9
+trend-comparison figures plus equivalent-validation metrics.
 """
 
 from __future__ import annotations
@@ -23,11 +23,22 @@ REPORTS_DIR = OUTPUT_DIR / "reports"
 FIGURE_DIR = REPORTS_DIR / "figures"
 REFERENCE_DIR = ROOT / "data" / "reference" / "flac3d_example3_3_free_field"
 HISTORY_ALL = RESULTS_DIR / "history_all_points.csv"
+HISTORY_CANDIDATES = [
+    HISTORY_ALL,
+    ROOT / "output" / "example3_3_2d_kohler_native_mpm_solver" / "new_geometry_corrected_dynamic_run" / "history.csv",
+]
 
-MPM_CURVE_COLUMNS = {
-    "MPM-main-grid-top": "mpm_main_grid_top_xvel",
-    "MPM-left-ff-column-top": "mpm_left_ff_column_top_xvel",
-    "MPM-right-ff-column-top": "mpm_right_ff_column_top_xvel",
+MPM_CURVE_COLUMN_CANDIDATES = {
+    "MPM-soil-column-top": (
+        "soil_column_top_vx",
+        "free_field_top_vx",
+        "mpm_left_ff_column_top_xvel",
+    ),
+    "MPM-main-model-top": (
+        "main_model_top_vx",
+        "main_top_vx",
+        "mpm_main_grid_top_xvel",
+    ),
 }
 
 REFERENCE_FILES = {
@@ -37,9 +48,8 @@ REFERENCE_FILES = {
 }
 
 METRIC_CASES = [
-    ("MPM-main-grid-top vs FLAC-main", "MPM-main-grid-top", "FLAC-main"),
-    ("MPM-left-ff-column-top vs FLAC-free", "MPM-left-ff-column-top", "FLAC-free"),
-    ("MPM-right-ff-column-top vs FLAC-free", "MPM-right-ff-column-top", "FLAC-free"),
+    ("MPM-soil-column-top vs FLAC-free", "MPM-soil-column-top", "FLAC-free"),
+    ("MPM-main-model-top vs FLAC-main", "MPM-main-model-top", "FLAC-main"),
 ]
 
 TREND_CORRELATION_MIN = 0.85
@@ -54,6 +64,30 @@ def read_csv_columns(path: Path) -> dict[str, np.ndarray]:
         raise ValueError(f"No rows in {path}")
     data = np.atleast_1d(data)
     return {name: np.asarray(data[name], dtype=float) for name in data.dtype.names or []}
+
+
+def resolve_history_path() -> Path:
+    for path in HISTORY_CANDIDATES:
+        if path.exists():
+            return path
+    candidates = "\n".join(f"- {path}" for path in HISTORY_CANDIDATES)
+    raise FileNotFoundError(f"No supported history file found. Checked:\n{candidates}")
+
+
+def resolve_mpm_curves(data: dict[str, np.ndarray], mask: np.ndarray) -> dict[str, np.ndarray]:
+    curves: dict[str, np.ndarray] = {}
+    missing: dict[str, tuple[str, ...]] = {}
+    for label, candidates in MPM_CURVE_COLUMN_CANDIDATES.items():
+        for column in candidates:
+            if column in data:
+                curves[label] = data[column][mask]
+                break
+        else:
+            missing[label] = candidates
+    if missing:
+        details = "; ".join(f"{label}: {columns}" for label, columns in missing.items())
+        raise KeyError(f"Missing top-monitor history columns. Expected one candidate per monitor: {details}")
+    return curves
 
 
 def read_reference(path: Path) -> tuple[np.ndarray, np.ndarray] | None:
@@ -181,7 +215,7 @@ def plot_mpm_only(t: np.ndarray, mpm: dict[str, np.ndarray]) -> Path:
     plt.figure(figsize=(8.8, 5.2))
     for label, values in mpm.items():
         plt.plot(t, values, label=label, linewidth=1.9)
-    style_axes("Figure 3.9 equivalent MPM-only top x-velocity histories")
+    style_axes("Figure 3.9 MPM top-monitor x-velocity histories")
     plt.savefig(path, dpi=180)
     plt.close()
     return path
@@ -234,14 +268,12 @@ def missing_metric_row() -> dict[str, float | str]:
 
 def main() -> None:
     FIGURE_DIR.mkdir(parents=True, exist_ok=True)
-    data = read_csv_columns(HISTORY_ALL)
+    history_path = resolve_history_path()
+    data = read_csv_columns(history_path)
     t = data["time"] if "time" in data else data["time_s"]
     mask = (t >= 0.0) & (t <= 0.015)
     t_plot = t[mask]
-    missing_columns = [column for column in MPM_CURVE_COLUMNS.values() if column not in data]
-    if missing_columns:
-        raise KeyError(f"Missing equivalent MPM history columns: {missing_columns}")
-    mpm = {label: data[column][mask] for label, column in MPM_CURVE_COLUMNS.items()}
+    mpm = resolve_mpm_curves(data, mask)
     refs = reference_curves()
 
     compare_path = plot_compare(t_plot, mpm, refs)
@@ -257,6 +289,7 @@ def main() -> None:
         metric_rows.append(row)
     metrics_path = write_metrics(metric_rows)
 
+    print(f"History source: {history_path}")
     print(f"Figure 3.9 comparison: {compare_path}")
     print(f"Figure 3.9 MPM-only: {mpm_only_path}")
     print(f"Figure 3.9 reference-only: {ref_only_path}")
