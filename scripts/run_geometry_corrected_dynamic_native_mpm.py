@@ -1,6 +1,7 @@
 import csv
 import importlib.util
 import math
+import os
 import shutil
 import sys
 import types
@@ -21,16 +22,22 @@ if str(ROOT) not in sys.path:
 from src.mpm.mainMPM import MPM  # noqa: E402
 from src.utils import GlobalVariable  # noqa: E402
 
-GEOMETRY_DIR = ROOT / "output" / "example3_3_2d_kohler_native_mpm_solver" / "geometry_only_corrected"
-RUN_DIR = ROOT / "output" / "example3_3_2d_kohler_native_mpm_solver" / "new_geometry_corrected_dynamic_run"
+OUTPUT_ROOT = ROOT / "output" / "example3_3_2d_kohler_native_mpm_solver"
+GEOMETRY_NAME = os.environ.get("EX33_GEOMETRY_NAME", "geometry_only_corrected")
+GEOMETRY_DIR = OUTPUT_ROOT / GEOMETRY_NAME
+MPM_MAPPING = os.environ.get("EX33_MPM_MAPPING", "MUSL")
+MPM_SHAPE_FUNCTION = os.environ.get("EX33_MPM_SHAPE_FUNCTION", "Linear")
+SIDE_COUPLING_MODE = os.environ.get("EX33_SIDE_COUPLING", "grid")
+BOTTOM_COUPLING_MODE = os.environ.get("EX33_BOTTOM_COUPLING", "grid")
+SIDE_X_IMPEDANCE_MODE = os.environ.get("EX33_SIDE_X_IMPEDANCE", "Cp")
+RUN_NAME = os.environ.get("EX33_RUN_NAME", f"new_geometry_corrected_dynamic_run_{MPM_MAPPING.lower()}_{MPM_SHAPE_FUNCTION.lower()}")
+RUN_DIR = OUTPUT_ROOT / RUN_NAME
 REFERENCE_DIR = ROOT / "data" / "reference" / "flac3d_example3_3_free_field"
 LEGACY_NATIVE = ROOT / "examples" / "example3_3_2d_kohler_native_mpm_solver.py"
 
-DX = 0.25
-GRID_CELLS_X = 42
-GRID_CELLS_Z = 32
-DOMAIN_WIDTH = GRID_CELLS_X * DX
-DOMAIN_HEIGHT = GRID_CELLS_Z * DX
+DX = float(os.environ.get("EX33_DX", "0.25"))
+DOMAIN_WIDTH = 10.5
+DOMAIN_HEIGHT = 8.0
 MATERIAL_ID = 1
 MAIN_BODY_ID = 0
 LEFT_FF_BODY_ID = 1
@@ -45,23 +52,41 @@ CS = math.sqrt(G / RHO)
 CP = math.sqrt((K + 4.0 * G / 3.0) / RHO)
 RHO_CS = RHO * CS
 RHO_CP = RHO * CP
+SIDE_ETA_X = RHO_CS if SIDE_X_IMPEDANCE_MODE.lower() == "cs" else RHO_CP
+SIDE_ETA_Z = RHO_CP if SIDE_X_IMPEDANCE_MODE.lower() == "cs" else RHO_CS
+SIDE_PARTICLE_SCALE = 0.0 if SIDE_COUPLING_MODE.lower() == "grid" else 1.0
+BOTTOM_PARTICLE_SCALE = 0.0 if BOTTOM_COUPLING_MODE.lower() == "grid" else 1.0
 
 DT = 1.0e-5
 SIMULATION_TIME = 0.015
 INPUT_PERIOD = 0.01
 INPUT_VELOCITY_AMPLITUDE = 0.05
-BOTTOM_Z = 1.875
-LEFT_MAIN_X = 1.125
-LEFT_FF_X = 0.375
-RIGHT_MAIN_X = 8.875
-RIGHT_FF_X = 9.625
-TOP_MAIN_MODEL_TARGET = (2.0, 6.75)
-TOP_SOIL_COLUMN_TARGET = (0.375, 6.625)
-REFLECTION_MONITOR_Z = 6.625
+INPUT_TIME_SHIFT = float(os.environ.get("EX33_INPUT_TIME_SHIFT", "0.0"))
+HISTORY_TIME_SHIFT = float(os.environ.get("EX33_HISTORY_TIME_SHIFT", "0.0"))
+BOTTOM_GRID_Z = 1.75
+BOTTOM_Z = BOTTOM_GRID_Z + 0.5 * DX
+TOP_GRID_Z = 5.75
+TOP_PARTICLE_Z = TOP_GRID_Z - 0.5 * DX
+VALLEY_GRID_Z = 3.5
+LEFT_MAIN_X = 1.0 + 0.5 * DX
+LEFT_FF_X = 1.0 - 0.5 - 0.5 * DX
+RIGHT_MAIN_X = 7.0 - 0.5 * DX
+RIGHT_FF_X = 7.0 + 0.5 + 0.5 * DX
+SOIL_COLUMN_X = LEFT_FF_X
+SOIL_COLUMN_BOTTOM_TARGET = (SOIL_COLUMN_X, BOTTOM_Z)
+SOIL_COLUMN_3M_TARGET = (SOIL_COLUMN_X, BOTTOM_Z + 3.0)
+MAIN_MODEL_BOTTOM_TARGET = (4.0, BOTTOM_Z)
+MAIN_MODEL_3M_TARGET = (2.0, BOTTOM_Z + 3.0)
+SOIL_GRID_BOTTOM_TARGET = SOIL_COLUMN_BOTTOM_TARGET
+MAIN_GRID_BOTTOM_TARGET = MAIN_MODEL_BOTTOM_TARGET
+MAIN_GRID_TOP_MANUAL_TARGET = (2.0, TOP_GRID_Z)
+MAIN_GRID_TOP_CENTER_TARGET = (4.0, VALLEY_GRID_Z)
+SOIL_GRID_TOP_TARGET = (0.375, TOP_GRID_Z)
+REFLECTION_MONITOR_Z = TOP_PARTICLE_Z
 REFLECTION_TARGETS = {
     "main_left_inside": (1.25, REFLECTION_MONITOR_Z),
-    "main_center": (5.0, REFLECTION_MONITOR_Z),
-    "main_right_inside": (8.75, REFLECTION_MONITOR_Z),
+    "main_center": (4.0, REFLECTION_MONITOR_Z),
+    "main_right_inside": (6.75, REFLECTION_MONITOR_Z),
 }
 
 
@@ -84,6 +109,7 @@ def all_particle_region(x):
 
 @ti.kernel
 def update_corrected_particle_tractions(
+    total_nodes: ti.i32,
     bottom_count: ti.i32,
     bottom_particle_ids: ti.template(),
     bottom_traction_ids: ti.template(),
@@ -97,10 +123,19 @@ def update_corrected_particle_tractions(
     input_velocity: ti.f64,
     rho_cs: ti.f64,
     rho_cp: ti.f64,
+    side_eta_x: ti.f64,
+    side_eta_z: ti.f64,
+    side_particle_scale: ti.f64,
+    bottom_particle_scale: ti.f64,
     particle: ti.template(),
+    node: ti.template(),
+    ln_id: ti.template(),
+    shape_fn: ti.template(),
+    node_size: ti.template(),
     particle_traction: ti.template(),
     total_input_force: ti.template(),
-    total_dashpot_force_x: ti.template(),
+    total_dashpot_force_particle_x: ti.template(),
+    total_dashpot_force_grid_x: ti.template(),
     total_dashpot_force_z: ti.template(),
     total_bottom_force_x: ti.template(),
     total_bottom_force_z: ti.template(),
@@ -108,7 +143,8 @@ def update_corrected_particle_tractions(
     total_side_main_force_z: ti.template(),
 ):
     total_input_force[None] = 0.0
-    total_dashpot_force_x[None] = 0.0
+    total_dashpot_force_particle_x[None] = 0.0
+    total_dashpot_force_grid_x[None] = 0.0
     total_dashpot_force_z[None] = 0.0
     total_bottom_force_x[None] = 0.0
     total_bottom_force_z[None] = 0.0
@@ -119,35 +155,134 @@ def update_corrected_particle_tractions(
         pid = bottom_particle_ids[i]
         tid = bottom_traction_ids[i]
         area = bottom_areas[i]
+        body_id = int(particle[pid].bodyID)
+        boundary_grid_velocity = ti.Vector([0.0, 0.0])
+        offset = pid * total_nodes
+        for ln in range(offset, offset + int(node_size[pid])):
+            node_id = ln_id[ln]
+            boundary_grid_velocity += shape_fn[ln] * node[node_id, body_id].momentum
         input_tx = 2.0 * rho_cs * input_velocity
-        dashpot_tx = -rho_cs * particle[pid].v[0]
+        dashpot_particle_tx = -rho_cs * particle[pid].v[0]
+        dashpot_grid_tx = -rho_cs * boundary_grid_velocity[0]
         dashpot_tz = -rho_cp * particle[pid].v[1]
-        tx = input_tx + dashpot_tx
+        tx = input_tx + dashpot_grid_tx
         tz = dashpot_tz
-        particle_traction[tid].traction = ti.Vector([tx, tz])
+        particle_traction[tid].traction = bottom_particle_scale * ti.Vector([tx, tz])
         total_input_force[None] += area * input_tx
-        total_dashpot_force_x[None] += area * dashpot_tx
-        total_dashpot_force_z[None] += area * dashpot_tz
-        total_bottom_force_x[None] += area * tx
-        total_bottom_force_z[None] += area * tz
+        total_dashpot_force_particle_x[None] += area * dashpot_particle_tx
+        total_dashpot_force_grid_x[None] += area * dashpot_grid_tx
+        total_dashpot_force_z[None] += bottom_particle_scale * area * dashpot_tz
+        total_bottom_force_x[None] += bottom_particle_scale * area * tx
+        total_bottom_force_z[None] += bottom_particle_scale * area * tz
 
     for i in range(pair_count):
         main_pid = main_particle_ids[i]
         ff_pid = ff_particle_ids[i]
         mtid = main_traction_ids[i]
         ftid = ff_traction_ids[i]
-        n = side_signs[i]
         vrel = particle[ff_pid].v - particle[main_pid].v
-        sigma_ff = particle[ff_pid].stress
-        sigma_main = particle[main_pid].stress
-        stress_diff = sigma_ff - sigma_main
-        tx = n * stress_diff[0] + rho_cp * vrel[0]
-        tz = n * stress_diff[3] + rho_cs * vrel[1]
-        traction = ti.Vector([tx, tz])
+        tx = side_eta_x * vrel[0]
+        tz = side_eta_z * vrel[1]
+        traction = side_particle_scale * ti.Vector([tx, tz])
         particle_traction[mtid].traction = traction
         particle_traction[ftid].traction = -traction
         total_side_main_force_x[None] += DX * tx
         total_side_main_force_z[None] += DX * tz
+
+
+@ti.kernel
+def apply_grid_side_dashpot(
+    total_nodes: ti.i32,
+    pair_count: ti.i32,
+    main_particle_ids: ti.template(),
+    ff_particle_ids: ti.template(),
+    areas: ti.template(),
+    side_eta_x: ti.f64,
+    side_eta_z: ti.f64,
+    particle: ti.template(),
+    node: ti.template(),
+    ln_id: ti.template(),
+    shape_fn: ti.template(),
+    node_size: ti.template(),
+    total_grid_side_main_force_x: ti.template(),
+    total_grid_side_main_force_z: ti.template(),
+):
+    total_grid_side_main_force_x[None] = 0.0
+    total_grid_side_main_force_z[None] = 0.0
+    for i in range(pair_count):
+        main_pid = main_particle_ids[i]
+        ff_pid = ff_particle_ids[i]
+        main_body = int(particle[main_pid].bodyID)
+        ff_body = int(particle[ff_pid].bodyID)
+        area = areas[i]
+        v_main = ti.Vector([0.0, 0.0])
+        v_ff = ti.Vector([0.0, 0.0])
+        main_offset = main_pid * total_nodes
+        ff_offset = ff_pid * total_nodes
+        for ln in range(main_offset, main_offset + int(node_size[main_pid])):
+            node_id = ln_id[ln]
+            v_main += shape_fn[ln] * node[node_id, main_body].momentum
+        for ln in range(ff_offset, ff_offset + int(node_size[ff_pid])):
+            node_id = ln_id[ln]
+            v_ff += shape_fn[ln] * node[node_id, ff_body].momentum
+        vrel = v_ff - v_main
+        force = ti.Vector([side_eta_x * area * vrel[0], side_eta_z * area * vrel[1]])
+        for ln in range(main_offset, main_offset + int(node_size[main_pid])):
+            node_id = ln_id[ln]
+            node[node_id, main_body]._update_nodal_force(shape_fn[ln] * force)
+        for ln in range(ff_offset, ff_offset + int(node_size[ff_pid])):
+            node_id = ln_id[ln]
+            node[node_id, ff_body]._update_nodal_force(-shape_fn[ln] * force)
+        total_grid_side_main_force_x[None] += force[0]
+        total_grid_side_main_force_z[None] += force[1]
+
+
+@ti.kernel
+def apply_grid_bottom_compliant_base(
+    total_nodes: ti.i32,
+    bottom_count: ti.i32,
+    bottom_particle_ids: ti.template(),
+    bottom_areas: ti.template(),
+    input_velocity: ti.f64,
+    rho_cs: ti.f64,
+    rho_cp: ti.f64,
+    particle: ti.template(),
+    node: ti.template(),
+    ln_id: ti.template(),
+    shape_fn: ti.template(),
+    node_size: ti.template(),
+    total_input_force: ti.template(),
+    total_dashpot_force_grid_x: ti.template(),
+    total_dashpot_force_z: ti.template(),
+    total_bottom_force_x: ti.template(),
+    total_bottom_force_z: ti.template(),
+):
+    total_input_force[None] = 0.0
+    total_dashpot_force_grid_x[None] = 0.0
+    total_dashpot_force_z[None] = 0.0
+    total_bottom_force_x[None] = 0.0
+    total_bottom_force_z[None] = 0.0
+    for i in range(bottom_count):
+        pid = bottom_particle_ids[i]
+        area = bottom_areas[i]
+        body_id = int(particle[pid].bodyID)
+        boundary_grid_velocity = ti.Vector([0.0, 0.0])
+        offset = pid * total_nodes
+        for ln in range(offset, offset + int(node_size[pid])):
+            node_id = ln_id[ln]
+            boundary_grid_velocity += shape_fn[ln] * node[node_id, body_id].momentum
+        input_tx = 2.0 * rho_cs * input_velocity
+        dashpot_tx = -rho_cs * boundary_grid_velocity[0]
+        dashpot_tz = -rho_cp * boundary_grid_velocity[1]
+        total_force = area * ti.Vector([input_tx + dashpot_tx, dashpot_tz])
+        for ln in range(offset, offset + int(node_size[pid])):
+            node_id = ln_id[ln]
+            node[node_id, body_id]._update_nodal_force(shape_fn[ln] * total_force)
+        total_input_force[None] += area * input_tx
+        total_dashpot_force_grid_x[None] += area * dashpot_tx
+        total_dashpot_force_z[None] += area * dashpot_tz
+        total_bottom_force_x[None] += total_force[0]
+        total_bottom_force_z[None] += total_force[1]
 
 
 def input_velocity(time_value: float) -> float:
@@ -240,6 +375,38 @@ def register_particle_tractions(mpm: MPM) -> None:
     )
 
 
+def install_grid_side_force_hook(mpm: MPM, trace: dict[str, int]) -> None:
+    """Insert grid-level side dashpot force after internal force assembly."""
+
+    original_add_engine = mpm.add_engine
+
+    def traced_add_engine() -> None:
+        original_add_engine()
+        engine = mpm.enginer
+        if getattr(engine, "_geometry_corrected_grid_side_hook_installed", False):
+            return
+        original_compute_forces = engine.compute_forces
+
+        def compute_forces_with_grid_side(sims: Any, scene: Any) -> Any:
+            result = original_compute_forces(sims, scene)
+            boundary = getattr(mpm, "native_compliant_base", None)
+            if boundary is not None:
+                boundary.apply_grid_boundary_forces(sims, scene)
+                trace["grid_boundary_force_calls"] = trace.get("grid_boundary_force_calls", 0) + 1
+                if SIDE_COUPLING_MODE.lower() == "grid":
+                    trace["grid_side_dashpot_calls"] = trace.get("grid_side_dashpot_calls", 0) + 1
+                if BOTTOM_COUPLING_MODE.lower() == "grid":
+                    trace["grid_bottom_compliant_base_calls"] = trace.get("grid_bottom_compliant_base_calls", 0) + 1
+                boundary.record_stage(sims, scene, "after_grid_boundary_forces")
+            return result
+
+        compute_forces_with_grid_side.__name__ = getattr(original_compute_forces, "__name__", "compute_forces")
+        engine.compute_forces = compute_forces_with_grid_side
+        engine._geometry_corrected_grid_side_hook_installed = True
+
+    mpm.add_engine = traced_add_engine
+
+
 class CorrectedBoundary:
     def __init__(self, mpm: MPM, pair_rows: list[dict[str, str]]) -> None:
         self.mpm = mpm
@@ -271,19 +438,53 @@ class CorrectedBoundary:
             self.ff_traction_ids[i] = int(row["ff_traction_id"])
 
         self.total_input_force = ti.field(dtype=ti.f64, shape=())
-        self.total_dashpot_force_x = ti.field(dtype=ti.f64, shape=())
+        self.total_dashpot_force_particle_x = ti.field(dtype=ti.f64, shape=())
+        self.total_dashpot_force_grid_x = ti.field(dtype=ti.f64, shape=())
         self.total_dashpot_force_z = ti.field(dtype=ti.f64, shape=())
         self.total_bottom_force_x = ti.field(dtype=ti.f64, shape=())
         self.total_bottom_force_z = ti.field(dtype=ti.f64, shape=())
         self.total_side_main_force_x = ti.field(dtype=ti.f64, shape=())
         self.total_side_main_force_z = ti.field(dtype=ti.f64, shape=())
+        self.total_grid_side_main_force_x = ti.field(dtype=ti.f64, shape=())
+        self.total_grid_side_main_force_z = ti.field(dtype=ti.f64, shape=())
+
+        self.grid_side_main_nodes = ti.field(dtype=ti.i32, shape=self.interface_pair_count)
+        self.grid_side_ff_nodes = ti.field(dtype=ti.i32, shape=self.interface_pair_count)
+        self.grid_side_main_body_ids = ti.field(dtype=ti.i32, shape=self.interface_pair_count)
+        self.grid_side_ff_body_ids = ti.field(dtype=ti.i32, shape=self.interface_pair_count)
+        self.grid_side_areas = ti.field(dtype=ti.f64, shape=self.interface_pair_count)
+        self.grid_side_initialized = False
+        self.grid_side_specs: list[dict[str, Any]] = []
+
+        self.grid_bottom_nodes = ti.field(dtype=ti.i32, shape=self.bottom_count)
+        self.grid_bottom_body_ids = ti.field(dtype=ti.i32, shape=self.bottom_count)
+        self.grid_bottom_areas = ti.field(dtype=ti.f64, shape=self.bottom_count)
+        self.grid_bottom_initialized = False
+        self.grid_bottom_specs: list[dict[str, Any]] = []
 
         self.bottom_rows: list[dict[str, Any]] = []
         self.side_rows: list[dict[str, Any]] = []
         self.monitor_rows: list[dict[str, Any]] = []
         self.reflection_rows: list[dict[str, Any]] = []
-        self.main_model_top_particle = self._nearest_particle(MAIN_BODY_ID, *TOP_MAIN_MODEL_TARGET)
-        self.soil_column_top_particle = self._nearest_particle(LEFT_FF_BODY_ID, *TOP_SOIL_COLUMN_TARGET)
+        self.monitor_specs = [
+            ("soil_column_bottom", LEFT_FF_BODY_ID, SOIL_COLUMN_BOTTOM_TARGET),
+            ("soil_column_3m", LEFT_FF_BODY_ID, SOIL_COLUMN_3M_TARGET),
+            ("main_model_bottom", MAIN_BODY_ID, MAIN_MODEL_BOTTOM_TARGET),
+            ("main_model_3m", MAIN_BODY_ID, MAIN_MODEL_3M_TARGET),
+        ]
+        self.monitor_particles = {
+            name: self._nearest_particle(body_id, *target)
+            for name, body_id, target in self.monitor_specs
+        }
+        self.grid_monitor_specs = [
+            ("soil_grid_bottom", LEFT_FF_BODY_ID, SOIL_GRID_BOTTOM_TARGET),
+            ("main_grid_bottom", MAIN_BODY_ID, MAIN_GRID_BOTTOM_TARGET),
+            ("main_grid_top_manual", MAIN_BODY_ID, MAIN_GRID_TOP_MANUAL_TARGET),
+            ("main_grid_top_center", MAIN_BODY_ID, MAIN_GRID_TOP_CENTER_TARGET),
+            ("soil_grid_top", LEFT_FF_BODY_ID, SOIL_GRID_TOP_TARGET),
+        ]
+        self.grid_monitor_nodes: dict[str, int] = {}
+        self.pt40_particle = 40 if int(mpm.scene.particleNum[0]) > 40 else -1
         self.reflection_particles = {
             name: self._reflection_particle(*target)
             for name, target in REFLECTION_TARGETS.items()
@@ -305,7 +506,16 @@ class CorrectedBoundary:
             if abs(float(pos[pid, 1]) - BOTTOM_Z) <= 1.0e-10:
                 if pid not in traction_indices:
                     raise RuntimeError(f"Bottom particle {pid} has no traction constraint")
-                specs.append({"particle_id": pid, "traction_id": traction_indices[pid], "body_id": int(body[pid]), "area": float(vol[pid]) / DX})
+                specs.append(
+                    {
+                        "particle_id": pid,
+                        "traction_id": traction_indices[pid],
+                        "body_id": int(body[pid]),
+                        "x": float(pos[pid, 0]),
+                        "z": float(pos[pid, 1]),
+                        "area": float(vol[pid]) / DX,
+                    }
+                )
         return specs
 
     def _interface_specs(self, traction_indices: dict[int, int]) -> list[dict[str, Any]]:
@@ -367,9 +577,132 @@ class CorrectedBoundary:
         column_ids = [pid for pid in main_ids if abs(abs(float(pos[pid, 0]) - x) - min_dx) <= 1.0e-10]
         return max(column_ids, key=lambda pid: float(pos[pid, 1]))
 
+    def _nearest_grid_node_with_mass(self, scene: Any, body_id: int, x: float, z: float) -> int:
+        coords = np.asarray(scene.element.get_nodal_coords(), dtype=float)
+        masses = scene.node.m.to_numpy()[:, body_id]
+        valid = masses > float(scene.mass_cut_off)
+        if not np.any(valid):
+            raise RuntimeError(f"No active grid nodes for body_id={body_id}")
+        dx = coords[:, 0] - x
+        dz = coords[:, 1] - z
+        distance = dx * dx + dz * dz
+        distance[~valid] = np.inf
+        node_id = int(np.argmin(distance))
+        if not math.isfinite(float(distance[node_id])):
+            raise RuntimeError(f"No valid grid node near body_id={body_id}, x={x}, z={z}")
+        return node_id
+
+    def _initialize_grid_side_pairs(self, scene: Any) -> None:
+        if self.grid_side_initialized:
+            return
+        specs: list[dict[str, Any]] = []
+        coords = np.asarray(scene.element.get_nodal_coords(), dtype=float)
+        for i, row in enumerate(self.interface_specs):
+            main_body = int(row["main_body_id"])
+            ff_body = int(row["ff_body_id"])
+            main_node = self._nearest_grid_node_with_mass(scene, main_body, float(row["main_x"]), float(row["main_z"]))
+            ff_node = self._nearest_grid_node_with_mass(scene, ff_body, float(row["ff_x"]), float(row["ff_z"]))
+            area = DX
+            self.grid_side_main_nodes[i] = main_node
+            self.grid_side_ff_nodes[i] = ff_node
+            self.grid_side_main_body_ids[i] = main_body
+            self.grid_side_ff_body_ids[i] = ff_body
+            self.grid_side_areas[i] = area
+            specs.append(
+                {
+                    "pair_id": int(row["pair_id"]),
+                    "side": row["side"],
+                    "main_node": main_node,
+                    "ff_node": ff_node,
+                    "main_body_id": main_body,
+                    "ff_body_id": ff_body,
+                    "main_node_x": float(coords[main_node, 0]),
+                    "main_node_z": float(coords[main_node, 1]),
+                    "ff_node_x": float(coords[ff_node, 0]),
+                    "ff_node_z": float(coords[ff_node, 1]),
+                    "area": area,
+                }
+            )
+        self.grid_side_specs = specs
+        self.grid_side_initialized = True
+
+    def _initialize_grid_bottom_nodes(self, scene: Any) -> None:
+        if self.grid_bottom_initialized:
+            return
+        specs: list[dict[str, Any]] = []
+        coords = np.asarray(scene.element.get_nodal_coords(), dtype=float)
+        for i, row in enumerate(self.bottom_specs):
+            body_id = int(row["body_id"])
+            node_id = self._nearest_grid_node_with_mass(scene, body_id, float(row["x"]), float(row["z"]))
+            area = float(row["area"])
+            self.grid_bottom_nodes[i] = node_id
+            self.grid_bottom_body_ids[i] = body_id
+            self.grid_bottom_areas[i] = area
+            specs.append(
+                {
+                    "particle_id": int(row["particle_id"]),
+                    "body_id": body_id,
+                    "node_id": node_id,
+                    "particle_x": float(row["x"]),
+                    "particle_z": float(row["z"]),
+                    "node_x": float(coords[node_id, 0]),
+                    "node_z": float(coords[node_id, 1]),
+                    "area": area,
+                }
+            )
+        self.grid_bottom_specs = specs
+        self.grid_bottom_initialized = True
+
+    def apply_grid_boundary_forces(self, sims: Any, scene: Any) -> None:
+        load_time = float(sims.current_time) + INPUT_TIME_SHIFT
+        v_in = input_velocity(load_time)
+        if BOTTOM_COUPLING_MODE.lower() == "grid":
+            self._initialize_grid_bottom_nodes(scene)
+            apply_grid_bottom_compliant_base(
+                scene.element.grid_nodes,
+                self.bottom_count,
+                self.bottom_particle_ids,
+                self.grid_bottom_areas,
+                v_in,
+                RHO_CS,
+                RHO_CP,
+                scene.particle,
+                scene.node,
+                scene.element.LnID,
+                scene.element.shape_fn,
+                scene.element.node_size,
+                self.total_input_force,
+                self.total_dashpot_force_grid_x,
+                self.total_dashpot_force_z,
+                self.total_bottom_force_x,
+                self.total_bottom_force_z,
+            )
+            self.record_bottom(sims, scene, v_in, load_time)
+        if SIDE_COUPLING_MODE.lower() != "grid":
+            return
+        self._initialize_grid_side_pairs(scene)
+        apply_grid_side_dashpot(
+            scene.element.grid_nodes,
+            self.interface_pair_count,
+            self.main_particle_ids,
+            self.ff_particle_ids,
+            self.grid_side_areas,
+            SIDE_ETA_X,
+            SIDE_ETA_Z,
+            scene.particle,
+            scene.node,
+            scene.element.LnID,
+            scene.element.shape_fn,
+            scene.element.node_size,
+            self.total_grid_side_main_force_x,
+            self.total_grid_side_main_force_z,
+        )
+
     def apply(self, sims: Any, scene: Any) -> None:
-        v_in = input_velocity(float(sims.current_time))
+        load_time = float(sims.current_time) + INPUT_TIME_SHIFT
+        v_in = input_velocity(load_time)
         update_corrected_particle_tractions(
+            scene.element.grid_nodes,
             self.bottom_count,
             self.bottom_particle_ids,
             self.bottom_traction_ids,
@@ -383,35 +716,49 @@ class CorrectedBoundary:
             v_in,
             RHO_CS,
             RHO_CP,
+            SIDE_ETA_X,
+            SIDE_ETA_Z,
+            SIDE_PARTICLE_SCALE,
+            BOTTOM_PARTICLE_SCALE,
             scene.particle,
+            scene.node,
+            scene.element.LnID,
+            scene.element.shape_fn,
+            scene.element.node_size,
             scene.boundary.particle_traction,
             self.total_input_force,
-            self.total_dashpot_force_x,
+            self.total_dashpot_force_particle_x,
+            self.total_dashpot_force_grid_x,
             self.total_dashpot_force_z,
             self.total_bottom_force_x,
             self.total_bottom_force_z,
             self.total_side_main_force_x,
             self.total_side_main_force_z,
         )
-        self.record_bottom(sims, scene, v_in)
+        if BOTTOM_COUPLING_MODE.lower() != "grid":
+            self.record_bottom(sims, scene, v_in, load_time)
         self.record_side(sims, scene)
 
     def record_stage(self, sims: Any, scene: Any, stage: str) -> None:
         return None
 
-    def record_bottom(self, sims: Any, scene: Any, v_in: float) -> None:
+    def record_bottom(self, sims: Any, scene: Any, v_in: float, load_time: float) -> None:
         self.bottom_rows.append(
             {
                 "time": float(sims.current_time),
+                "load_time": load_time,
+                "input_time_shift": INPUT_TIME_SHIFT,
                 "input_velocity": v_in,
                 "input_traction": 2.0 * RHO_CS * v_in,
                 "total_input_force": float(self.total_input_force[None]),
-                "total_dashpot_force_x": float(self.total_dashpot_force_x[None]),
+                "total_dashpot_force_particle_x": float(self.total_dashpot_force_particle_x[None]),
+                "total_dashpot_force_grid_x": float(self.total_dashpot_force_grid_x[None]),
+                "total_dashpot_force_x": float(self.total_dashpot_force_grid_x[None]),
                 "total_dashpot_force_z": float(self.total_dashpot_force_z[None]),
                 "total_bottom_force_x": float(self.total_bottom_force_x[None]),
                 "total_bottom_force_z": float(self.total_bottom_force_z[None]),
                 "bottom_particle_count": self.bottom_count,
-                "formula": "t_total=2*rho*Cs*v_input-rho*C*v_particle",
+                "formula": "t_total=2*rho*Cs*v_input-rho*Cs*v_boundary_grid",
             }
         )
 
@@ -450,24 +797,47 @@ class CorrectedBoundary:
                     "action_reaction_error_x": main_tx + ff_tx,
                     "action_reaction_error_z": main_tz + ff_tz,
                     "status": "PASS" if abs(main_tx + ff_tx) <= 1.0e-10 and abs(main_tz + ff_tz) <= 1.0e-10 else "FAIL",
-                    "formula": "sigma_ff*n+rho*C*(v_ff-v_main)",
+                    "formula": f"dashpot connection: tx={SIDE_ETA_X:.12g}*(v_ff_x-v_main_x), tz={SIDE_ETA_Z:.12g}*(v_ff_z-v_main_z)",
                 }
             )
 
     def record_monitor(self, sims: Any, scene: Any) -> None:
-        mv = scene.particle[self.main_model_top_particle].v
-        sv = scene.particle[self.soil_column_top_particle].v
-        self.monitor_rows.append(
-            {
-                "time": float(sims.current_time),
-                "soil_column_top_particle_id": self.soil_column_top_particle,
-                "soil_column_top_vx": float(sv[0]),
-                "soil_column_top_velocity_magnitude": math.hypot(float(sv[0]), float(sv[1])),
-                "main_model_top_particle_id": self.main_model_top_particle,
-                "main_model_top_vx": float(mv[0]),
-                "main_model_top_velocity_magnitude": math.hypot(float(mv[0]), float(mv[1])),
-            }
-        )
+        solver_time = float(sims.current_time)
+        row: dict[str, Any] = {
+            "time": solver_time + HISTORY_TIME_SHIFT,
+            "solver_time": solver_time,
+            "history_time_shift": HISTORY_TIME_SHIFT,
+        }
+        if not self.grid_monitor_nodes:
+            coords = np.asarray(scene.element.get_nodal_coords(), dtype=float)
+            for name, body_id, target in self.grid_monitor_specs:
+                node_id = self._nearest_grid_node_with_mass(scene, body_id, *target)
+                self.grid_monitor_nodes[name] = node_id
+                row[f"{name}_node_id"] = node_id
+                row[f"{name}_x"] = float(coords[node_id, 0])
+                row[f"{name}_z"] = float(coords[node_id, 1])
+        for name, _, _ in self.monitor_specs:
+            pid = self.monitor_particles[name]
+            v = scene.particle[pid].v
+            row[f"{name}_particle_id"] = pid
+            row[f"{name}_vx"] = float(v[0])
+            row[f"{name}_velocity_magnitude"] = math.hypot(float(v[0]), float(v[1]))
+        coords = np.asarray(scene.element.get_nodal_coords(), dtype=float)
+        for name, body_id, _target in self.grid_monitor_specs:
+            node_id = self.grid_monitor_nodes[name]
+            v = scene.node[node_id, body_id].momentum
+            row[f"{name}_node_id"] = node_id
+            row[f"{name}_x"] = float(coords[node_id, 0])
+            row[f"{name}_z"] = float(coords[node_id, 1])
+            row[f"{name}_vx"] = float(v[0])
+            row[f"{name}_vz"] = float(v[1])
+            row[f"{name}_velocity_magnitude"] = math.hypot(float(v[0]), float(v[1]))
+        if self.pt40_particle >= 0:
+            v40 = scene.particle[self.pt40_particle].v
+            row["pt40_particle_id"] = self.pt40_particle
+            row["pt40_vx"] = float(v40[0])
+            row["pt40_velocity_magnitude"] = math.hypot(float(v40[0]), float(v40[1]))
+        self.monitor_rows.append(row)
         lv = scene.particle[self.reflection_particles["main_left_inside"]].v
         cv = scene.particle[self.reflection_particles["main_center"]].v
         rv = scene.particle[self.reflection_particles["main_right_inside"]].v
@@ -489,6 +859,7 @@ def build_mpm(trace: dict[str, int], particle_files: dict[int, tuple[Path, int]]
     ti.init(arch=ti.cpu, offline_cache=True, default_fp=ti.f64, default_ip=ti.i32, log_level=ti.ERROR)
     mpm = MPM(title='Example 3.3 "geometry corrected native MPM run"', log=False)
     legacy.install_native_trace_hooks(mpm, trace)
+    install_grid_side_force_hook(mpm, trace)
     mpm.set_configuration(
         log=False,
         domain=ti.Vector([DOMAIN_WIDTH, DOMAIN_HEIGHT]),
@@ -497,8 +868,8 @@ def build_mpm(trace: dict[str, int], particle_files: dict[int, tuple[Path, int]]
         gravity=ti.Vector([0.0, 0.0]),
         background_damping=0.0,
         alphaPIC=0.0,
-        mapping="USL",
-        shape_function="Linear",
+        mapping=MPM_MAPPING,
+        shape_function=MPM_SHAPE_FUNCTION,
         stabilize=None,
         material_type="Solid",
         visualize=False,
@@ -508,8 +879,8 @@ def build_mpm(trace: dict[str, int], particle_files: dict[int, tuple[Path, int]]
         log=False,
         memory={
             "max_material_number": 1,
-            "max_particle_number": 2000,
-            "max_constraint_number": {"max_velocity_constraint": 100, "max_particle_traction_constraint": 1000},
+            "max_particle_number": 10000,
+            "max_constraint_number": {"max_velocity_constraint": 100, "max_particle_traction_constraint": 10000},
         },
     )
     mpm.add_material(model="LinearElastic", material={"MaterialID": MATERIAL_ID, "Density": RHO, "YoungModulus": E, "PossionRatio": NU})
@@ -564,7 +935,20 @@ def metrics(model_t: np.ndarray, model_v: np.ndarray, ref_t: np.ndarray, ref_v: 
     m = model_v[mask]
     r = ref[mask]
     if t.size < 3:
-        return {"peak_error": math.nan, "nrmse": math.nan, "correlation": math.nan, "phase_difference": math.nan}
+        return {
+            "peak_error": math.nan,
+            "nrmse": math.nan,
+            "correlation": math.nan,
+            "phase_difference": math.nan,
+            "model_peak_time": math.nan,
+            "ref_peak_time": math.nan,
+            "peak_time_error": math.nan,
+            "model_first_arrival_time": math.nan,
+            "ref_first_arrival_time": math.nan,
+            "first_arrival_time_error": math.nan,
+            "best_time_shift": math.nan,
+            "nrmse_after_time_shift": math.nan,
+        }
     peak_error = float(np.max(np.abs(m)) - np.max(np.abs(r)))
     rmse = math.sqrt(float(np.mean((m - r) ** 2)))
     denom = float(np.max(r) - np.min(r))
@@ -572,36 +956,93 @@ def metrics(model_t: np.ndarray, model_v: np.ndarray, ref_t: np.ndarray, ref_v: 
     m0 = m - np.mean(m)
     r0 = r - np.mean(r)
     lag = int(np.argmax(np.correlate(m0, r0, mode="full")) - (r0.size - 1)) if np.std(m0) > 0 and np.std(r0) > 0 else 0
-    return {"peak_error": peak_error, "nrmse": rmse / denom if denom > 0 else math.nan, "correlation": corr, "phase_difference": lag * float(np.median(np.diff(t)))}
+    ref_peak_index = int(np.argmax(np.abs(r)))
+    model_peak_index = int(np.argmax(np.abs(m)))
+    ref_peak_time = float(t[ref_peak_index])
+    model_peak_time = float(t[model_peak_index])
+    ref_peak_abs = float(np.max(np.abs(r)))
+    arrival_threshold = 0.05 * ref_peak_abs
+    model_arrivals = np.flatnonzero(np.abs(m) >= arrival_threshold)
+    ref_arrivals = np.flatnonzero(np.abs(r) >= arrival_threshold)
+    model_arrival = float(t[int(model_arrivals[0])]) if model_arrivals.size else math.nan
+    ref_arrival = float(t[int(ref_arrivals[0])]) if ref_arrivals.size else math.nan
+
+    best_shift = 0.0
+    best_rmse = math.inf
+    ref_window = (ref_t >= float(np.min(t))) & (ref_t <= float(np.max(t)))
+    for shift in np.linspace(-0.003, 0.003, 601):
+        shifted = np.interp(ref_t, model_t - shift, model_v, left=np.nan, right=np.nan)
+        shifted_mask = ref_window & np.isfinite(shifted)
+        if np.count_nonzero(shifted_mask) < 3:
+            continue
+        shifted_rmse = math.sqrt(float(np.mean((shifted[shifted_mask] - ref_v[shifted_mask]) ** 2)))
+        if shifted_rmse < best_rmse:
+            best_rmse = shifted_rmse
+            best_shift = float(shift)
+
+    return {
+        "peak_error": peak_error,
+        "nrmse": rmse / denom if denom > 0 else math.nan,
+        "correlation": corr,
+        "phase_difference": lag * float(np.median(np.diff(t))),
+        "model_peak_time": model_peak_time,
+        "ref_peak_time": ref_peak_time,
+        "peak_time_error": model_peak_time - ref_peak_time,
+        "model_first_arrival_time": model_arrival,
+        "ref_first_arrival_time": ref_arrival,
+        "first_arrival_time_error": model_arrival - ref_arrival if math.isfinite(model_arrival) and math.isfinite(ref_arrival) else math.nan,
+        "best_time_shift": best_shift,
+        "nrmse_after_time_shift": best_rmse / denom if denom > 0 and math.isfinite(best_rmse) else math.nan,
+    }
 
 
 def write_history_and_figure(boundary: CorrectedBoundary) -> dict[str, dict[str, float]]:
     rows = boundary.monitor_rows
+    fieldnames = ["time", "solver_time", "history_time_shift"]
+    for name, _, _ in boundary.monitor_specs:
+        fieldnames.extend([f"{name}_particle_id", f"{name}_vx", f"{name}_velocity_magnitude"])
+    for name, _, _ in boundary.grid_monitor_specs:
+        fieldnames.extend([f"{name}_node_id", f"{name}_x", f"{name}_z", f"{name}_vx", f"{name}_vz", f"{name}_velocity_magnitude"])
+    if boundary.pt40_particle >= 0:
+        fieldnames.extend(["pt40_particle_id", "pt40_vx", "pt40_velocity_magnitude"])
     write_csv(
         RUN_DIR / "history.csv",
-        [
-            "time",
-            "soil_column_top_particle_id",
-            "soil_column_top_vx",
-            "soil_column_top_velocity_magnitude",
-            "main_model_top_particle_id",
-            "main_model_top_vx",
-            "main_model_top_velocity_magnitude",
-        ],
+        fieldnames,
         rows,
     )
+    grid_velocity_fields = ["time", "solver_time", "history_time_shift"]
+    for name, _, _ in boundary.grid_monitor_specs:
+        grid_velocity_fields.extend([f"{name}_node_id", f"{name}_x", f"{name}_z", f"{name}_vx", f"{name}_vz", f"{name}_velocity_magnitude"])
+    write_csv(
+        RUN_DIR / "grid_monitor_velocity.csv",
+        grid_velocity_fields,
+        [{field: row[field] for field in grid_velocity_fields} for row in rows],
+    )
     t = np.array([r["time"] for r in rows], dtype=float)
-    soil_column = np.array([r["soil_column_top_vx"] for r in rows], dtype=float)
-    main_model = np.array([r["main_model_top_vx"] for r in rows], dtype=float)
-    flac_main_t, flac_main_v = read_reference("reference_fig_3_9_flac_main.csv")
-    flac_free_t, flac_free_v = read_reference("reference_fig_3_9_flac_free.csv")
+    soil_column_3m = np.array([r["soil_column_3m_vx"] for r in rows], dtype=float)
+    main_model_3m = np.array([r["main_model_3m_vx"] for r in rows], dtype=float)
+    soil_column_bottom = np.array([r["soil_column_bottom_vx"] for r in rows], dtype=float)
+    main_model_bottom = np.array([r["main_model_bottom_vx"] for r in rows], dtype=float)
+    soil_grid_bottom = np.array([r["soil_grid_bottom_vx"] for r in rows], dtype=float)
+    main_grid_bottom = np.array([r["main_grid_bottom_vx"] for r in rows], dtype=float)
+    soil_grid_top = np.array([r["soil_grid_top_vx"] for r in rows], dtype=float)
+    main_grid_top = np.array([r["main_grid_top_manual_vx"] for r in rows], dtype=float)
+    flac_column_t, flac_column_v = read_reference("reference_fig_3_9_flac_column.csv")
+    flac_main_t, flac_main_v = read_reference("reference_fig_3_9_flac_main_correct.csv")
+    flac_free_t, flac_free_v = read_reference("reference_fig_3_9_flac_free_correct.csv")
+    mask_column = (flac_column_t >= 0.0) & (flac_column_t <= SIMULATION_TIME)
     mask_main = (flac_main_t >= 0.0) & (flac_main_t <= SIMULATION_TIME)
     mask_free = (flac_free_t >= 0.0) & (flac_free_t <= SIMULATION_TIME)
     fig, ax = plt.subplots(figsize=(8.8, 5.2))
     ax.plot(flac_main_t[mask_main], flac_main_v[mask_main], color="black", lw=1.8, label="FLAC3D main")
-    ax.plot(t, main_model, color="#c43c2d", lw=1.6, label="MPM main model top")
     ax.plot(flac_free_t[mask_free], flac_free_v[mask_free], color="#276fbf", lw=1.8, label="FLAC3D free-field")
-    ax.plot(t, soil_column, color="#2a9d55", lw=1.6, label="MPM soil column top")
+    for name, color in [
+        ("soil_column_bottom", "#8c5a2b"),
+        ("soil_column_3m", "#2a9d55"),
+        ("main_model_bottom", "#5b5f97"),
+        ("main_model_3m", "#c43c2d"),
+    ]:
+        ax.plot(t, np.array([r[f"{name}_vx"] for r in rows], dtype=float), lw=1.5, label=f"MPM {name}", color=color)
     ax.set_xlim(0.0, SIMULATION_TIME)
     ax.set_xlabel("time (s)")
     ax.set_ylabel("vx")
@@ -610,10 +1051,98 @@ def write_history_and_figure(boundary: CorrectedBoundary) -> dict[str, dict[str,
     fig.tight_layout()
     fig.savefig(RUN_DIR / "figure3_9_geometry_corrected.png", dpi=220)
     plt.close(fig)
-    return {
-        "soil_column_top vs FLAC3D free-field": metrics(t, soil_column, flac_free_t, flac_free_v),
-        "main_model_top vs FLAC3D main": metrics(t, main_model, flac_main_t, flac_main_v),
+
+    fig, ax = plt.subplots(figsize=(6.4, 4.8))
+    ax.plot(flac_column_t[mask_column], flac_column_v[mask_column], color="black", lw=1.2, label="FLAC-column")
+    ax.plot(flac_free_t[mask_free], flac_free_v[mask_free], color="#276fbf", lw=1.2, ls=(0, (4, 4)), label="FLAC-free")
+    ax.plot(flac_main_t[mask_main], flac_main_v[mask_main], color="#d43d2a", lw=1.2, ls=(0, (4, 4)), label="FLAC-main")
+    ax.plot(t, soil_grid_top, color="#2ca02c", lw=1.4, ls=(0, (1, 3)), label="MPM")
+    ax.set_xlim(0.0, SIMULATION_TIME)
+    ax.set_ylim(-0.02, 0.12)
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Vel [m/s]")
+    ax.legend(loc="upper right", frameon=False, fontsize=9)
+    fig.tight_layout()
+    fig.savefig(RUN_DIR / "figure3_9_doc_reference_style.png", dpi=220)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(8.8, 5.2))
+    ax.plot(flac_free_t[mask_free], flac_free_v[mask_free], color="#276fbf", lw=1.8, label="FLAC3D free-field")
+    ax.plot(t, soil_grid_top, color="#2a9d55", lw=1.5, ls="--", label="MPM soil_grid_top")
+    ax.plot(flac_main_t[mask_main], flac_main_v[mask_main], color="black", lw=1.8, label="FLAC3D main")
+    ax.plot(t, main_grid_top, color="#c43c2d", lw=1.5, ls="--", label="MPM main_grid_top")
+    ax.set_xlim(0.0, SIMULATION_TIME)
+    ax.set_ylim(-0.02, 0.12)
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("grid vx (m/s)")
+    ax.grid(True, alpha=0.28)
+    ax.legend(fontsize=9)
+    fig.tight_layout()
+    fig.savefig(RUN_DIR / "top_grid_monitor_vs_flac3d.png", dpi=220)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(8.8, 5.2))
+    ax.plot(t, soil_column_bottom, color="#8c5a2b", lw=1.4, label="MPM soil_column_bottom particle")
+    ax.plot(t, main_model_bottom, color="#5b5f97", lw=1.4, label="MPM main_model_bottom particle")
+    ax.plot(t, soil_grid_bottom, color="#2a9d55", lw=1.4, ls="--", label="MPM soil_grid_bottom")
+    ax.plot(t, main_grid_bottom, color="#c43c2d", lw=1.4, ls="--", label="MPM main_grid_bottom")
+    ax.set_xlim(0.0, SIMULATION_TIME)
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("vx")
+    ax.grid(True, alpha=0.28)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(RUN_DIR / "bottom_monitor_comparison.png", dpi=220)
+    plt.close(fig)
+
+    metric_rows = {
+        "soil_column_3m vs FLAC3D free-field": metrics(t, soil_column_3m, flac_free_t, flac_free_v),
+        "main_model_3m vs FLAC3D main": metrics(t, main_model_3m, flac_main_t, flac_main_v),
+        "soil_grid_top vs FLAC3D free-field": metrics(t, soil_grid_top, flac_free_t, flac_free_v),
+        "main_grid_top_manual vs FLAC3D main": metrics(t, main_grid_top, flac_main_t, flac_main_v),
     }
+    phase_fields = [
+        "case",
+        "peak_error",
+        "nrmse",
+        "correlation",
+        "phase_difference",
+        "model_peak_time",
+        "ref_peak_time",
+        "peak_time_error",
+        "model_first_arrival_time",
+        "ref_first_arrival_time",
+        "first_arrival_time_error",
+        "best_time_shift",
+        "nrmse_after_time_shift",
+    ]
+    write_csv(
+        RUN_DIR / "phase_alignment_summary.csv",
+        phase_fields,
+        [{"case": case, **values} for case, values in metric_rows.items()],
+    )
+
+    fig, ax = plt.subplots(figsize=(8.8, 5.2))
+    ax.plot(flac_main_t[mask_main], flac_main_v[mask_main], color="black", lw=1.8, label="FLAC3D main")
+    ax.plot(flac_free_t[mask_free], flac_free_v[mask_free], color="#276fbf", lw=1.8, label="FLAC3D free-field")
+    shifted_cases = [
+        ("soil_column_3m vs FLAC3D free-field", soil_column_3m, "#2a9d55", "MPM soil_column_3m phase-aligned"),
+        ("main_model_3m vs FLAC3D main", main_model_3m, "#c43c2d", "MPM main_model_3m phase-aligned"),
+        ("soil_grid_top vs FLAC3D free-field", soil_grid_top, "#7a9cc6", "MPM soil_grid_top phase-aligned"),
+        ("main_grid_top_manual vs FLAC3D main", main_grid_top, "#b56576", "MPM main_grid_top_manual phase-aligned"),
+    ]
+    for case, values, color, label in shifted_cases:
+        shift = float(metric_rows[case]["best_time_shift"])
+        ax.plot(t - shift, values, lw=1.35, label=f"{label} (shift={shift:.6g}s)", color=color)
+    ax.set_xlim(0.0, SIMULATION_TIME)
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("vx")
+    ax.grid(True, alpha=0.28)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(RUN_DIR / "figure3_9_phase_aligned.png", dpi=220)
+    plt.close(fig)
+    return metric_rows
 
 
 def write_reflection_history_and_report(boundary: CorrectedBoundary) -> None:
@@ -662,15 +1191,15 @@ def write_reflection_history_and_report(boundary: CorrectedBoundary) -> None:
     lines = [
         "# Reflection Diagnostic Report",
         "",
-        "Run checked: `new_geometry_corrected_dynamic_run`.",
+        f"Run checked: `{RUN_NAME}`.",
         "",
-        "Only history sampling was added. Solver, geometry, material, boundary formula, and side traction formula were not changed.",
+        "This diagnostic samples side and center histories after applying the current side-boundary formula.",
         "",
         "## Current Side Formula",
         "",
-        "`sigma_ff*n + rho*C*(v_ff-v_main)`",
+        f"`tx={SIDE_ETA_X:.12g}*(v_ff_x-v_main_x)`, `tz={SIDE_ETA_Z:.12g}*(v_ff_z-v_main_z)`",
         "",
-        "This diagnostic does not change that formula.",
+        "The formula follows dashpot connections between the main model and free-field columns.",
         "",
         "## Monitor Particles",
         "",
@@ -773,8 +1302,12 @@ def write_report(metric_rows: dict[str, dict[str, float]], trace: dict[str, int]
     n = int(boundary.mpm.scene.particleNum[0])
     pos = boundary.mpm.scene.particle.x.to_numpy()[:n]
     monitor_specs = [
-        ("soil_column_top", TOP_SOIL_COLUMN_TARGET, boundary.soil_column_top_particle),
-        ("main_model_top", TOP_MAIN_MODEL_TARGET, boundary.main_model_top_particle),
+        (name, target, boundary.monitor_particles[name])
+        for name, _, target in boundary.monitor_specs
+    ]
+    grid_monitor_specs = [
+        (name, target, boundary.grid_monitor_nodes.get(name, -1))
+        for name, _, target in boundary.grid_monitor_specs
     ]
     lines = [
         "# Geometry Corrected Dynamic Validation Report",
@@ -786,12 +1319,13 @@ def write_report(metric_rows: dict[str, dict[str, float]], trace: dict[str, int]
         "## Geometry Source",
         "",
         f"- source directory: `{GEOMETRY_DIR}`",
+        f"- geometry_name: `{GEOMETRY_NAME}`",
         "- geometry validation: `geometry_validation_checks.csv` status PASS",
-        "- particles/background grid/interface pairs loaded from geometry_only_corrected outputs; geometry was not regenerated.",
+        f"- particles/background grid/interface pairs loaded from `{GEOMETRY_NAME}` outputs; geometry was not regenerated.",
         "",
         "## Monitor Points",
         "",
-        "Only two monitor points are used in `history.csv`: soil-column top and main-model top.",
+        "Four monitor points are used in `history.csv`: soil-column bottom, soil-column 3 m height, main-model bottom, and main-model 3 m height.",
         "",
         "| point | target x | target z | particle id | selected x | selected z |",
         "| --- | ---: | ---: | ---: | ---: | ---: |",
@@ -802,50 +1336,97 @@ def write_report(metric_rows: dict[str, dict[str, float]], trace: dict[str, int]
         )
     lines += [
         "",
+        "## Gridpoint Monitor Points",
+        "",
+        "These grid monitors are intended to match FLAC3D `hist gp xvel` more closely than particle histories.",
+        "",
+        "| point | target x | target z | node id | selected x | selected z |",
+        "| --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    coords = np.asarray(boundary.mpm.scene.element.get_nodal_coords(), dtype=float)
+    for name, target, node_id in grid_monitor_specs:
+        lines.append(
+            f"| {name} | {target[0]:.12g} | {target[1]:.12g} | {node_id} | {float(coords[node_id, 0]):.12g} | {float(coords[node_id, 1]):.12g} |"
+        )
+    lines += [
+        "",
         "## Solver",
         "",
         "- solver: GeoTaichi native MPM",
+        f"- dx: {DX}",
+        f"- mapping: {MPM_MAPPING}",
+        f"- shape_function: {MPM_SHAPE_FUNCTION}",
+        f"- bottom_coupling_mode: {BOTTOM_COUPLING_MODE}",
+        f"- side_coupling_mode: {SIDE_COUPLING_MODE}",
+        f"- side_x_impedance_mode: {SIDE_X_IMPEDANCE_MODE}",
+        f"- side_eta_x: {SIDE_ETA_X}",
+        f"- side_eta_z: {SIDE_ETA_Z}",
+        f"- bottom_particle_scale: {BOTTOM_PARTICLE_SCALE}",
+        f"- side_particle_scale: {SIDE_PARTICLE_SCALE}",
         f"- native Solver.core calls: {trace.get('solver_core_calls', 0)}",
         f"- P2G calls: {trace.get('p2g_calls', 0)}",
         f"- G2P calls: {trace.get('g2p_calls', 0)}",
         f"- stress update calls: {trace.get('stress_update_calls', 0)}",
+        f"- grid-boundary force calls: {trace.get('grid_boundary_force_calls', 0)}",
+        f"- grid-bottom compliant-base calls: {trace.get('grid_bottom_compliant_base_calls', 0)}",
+        f"- grid-side dashpot calls: {trace.get('grid_side_dashpot_calls', 0)}",
         f"- simulation_time: {SIMULATION_TIME}",
         f"- dt: {DT}",
+        f"- input_time_shift: {INPUT_TIME_SHIFT}",
+        f"- history_time_shift: {HISTORY_TIME_SHIFT}",
         "",
         "## Bottom Boundary Check",
         "",
         "- velocity input period T: 0.01 s",
         "- direct velocity boundary: not used",
-        "- traction formula: `t_total = 2*rho*Cs*v_input - rho*Cs*v_particle` for x and absorbing `-rho*Cp*vz` for z.",
+        "- traction formula: `t_total = 2*rho*Cs*v_input - rho*Cs*v_boundary_grid` for x and absorbing `-rho*Cp*v_boundary_z` for z.",
+        f"- bottom coupling mode: `{BOTTOM_COUPLING_MODE}`",
+        "- grid bottom force distribution: MPM shape-function weights over each bottom particle support.",
         f"- check file: `{RUN_DIR / 'bottom_boundary_force_check.csv'}`",
+        f"- grid-bottom nearest-node diagnostic file: `{RUN_DIR / 'grid_bottom_node_check.csv'}`",
         "",
         "## Side Free-Field Check",
         "",
-        "- interface pairs: loaded from `geometry_only_corrected/geotaichi_interface_pair_check.csv`",
+        f"- interface pairs: loaded from `{GEOMETRY_NAME}/geotaichi_interface_pair_check.csv`",
         "- pair mapping: main particle to free-field particle, one-to-one",
-        "- formula currently used: `sigma_ff*n + rho*C*(v_ff-v_main)`",
+        f"- formula currently used: dashpot connection only, `tx={SIDE_ETA_X:.12g}*(v_ff_x-v_main_x)`, `tz={SIDE_ETA_Z:.12g}*(v_ff_z-v_main_z)`",
+        "- grid side force distribution: MPM shape-function weights over each paired main/free-field particle support.",
         f"- action-reaction status: {side_status}",
         f"- check file: `{RUN_DIR / 'side_boundary_force_check.csv'}`",
+        f"- grid-side pair file: `{RUN_DIR / 'grid_side_pair_check.csv'}`",
+        f"- total_grid_side_main_force_x_last: {float(boundary.total_grid_side_main_force_x[None])}",
+        f"- total_grid_side_main_force_z_last: {float(boundary.total_grid_side_main_force_z[None])}",
         "",
         "## Metrics",
         "",
-        "| case | peak error | NRMSE | correlation | phase difference |",
-        "| --- | ---: | ---: | ---: | ---: |",
+        "| case | peak error | NRMSE | shifted NRMSE | correlation | peak time error | best time shift | first arrival error |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for case, row in metric_rows.items():
-        lines.append(f"| {case} | {row['peak_error']:.12g} | {row['nrmse']:.12g} | {row['correlation']:.12g} | {row['phase_difference']:.12g} |")
+        lines.append(
+            f"| {case} | {row['peak_error']:.12g} | {row['nrmse']:.12g} | {row['nrmse_after_time_shift']:.12g} | "
+            f"{row['correlation']:.12g} | {row['peak_time_error']:.12g} | {row['best_time_shift']:.12g} | {row['first_arrival_time_error']:.12g} |"
+        )
     lines += [
         "",
         "## Files",
         "",
         f"- material check: `{RUN_DIR / 'material_parameter_check.csv'}`",
         f"- history: `{RUN_DIR / 'history.csv'}`",
+        f"- grid monitor velocity: `{RUN_DIR / 'grid_monitor_velocity.csv'}`",
+        f"- phase alignment summary: `{RUN_DIR / 'phase_alignment_summary.csv'}`",
         f"- Figure 3.9: `{RUN_DIR / 'figure3_9_geometry_corrected.png'}`",
+        f"- reference-document style Figure 3.9: `{RUN_DIR / 'figure3_9_doc_reference_style.png'}`",
+        f"- top grid monitor comparison: `{RUN_DIR / 'top_grid_monitor_vs_flac3d.png'}`",
+        f"- bottom monitor comparison: `{RUN_DIR / 'bottom_monitor_comparison.png'}`",
+        f"- phase-aligned Figure 3.9 diagnostic: `{RUN_DIR / 'figure3_9_phase_aligned.png'}`",
         f"- particles: `{RUN_DIR / 'particles_dynamic.vtu'}`",
         f"- grid: `{RUN_DIR / 'grid_dynamic.vtr'}`",
         f"- interface: `{RUN_DIR / 'interface_dynamic.vtk'}`",
+        f"- grid side pairs: `{RUN_DIR / 'grid_side_pair_check.csv'}`",
+        f"- grid bottom nodes: `{RUN_DIR / 'grid_bottom_node_check.csv'}`",
         "",
-        "No scaling, translation, sign flip, artificial amplitude adjustment, tuning, or optimization was applied.",
+        "No scaling, sign flip, artificial amplitude adjustment, tuning, or optimization was applied to the raw history. The phase-aligned figure is a diagnostic plot only and is reported separately from the raw Figure 3.9 output.",
     ]
     (RUN_DIR / "geometry_corrected_dynamic_validation_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -879,7 +1460,22 @@ def main() -> None:
     boundary: CorrectedBoundary = mpm.native_compliant_base
     write_csv(
         RUN_DIR / "bottom_boundary_force_check.csv",
-        ["time", "input_velocity", "input_traction", "total_input_force", "total_dashpot_force_x", "total_dashpot_force_z", "total_bottom_force_x", "total_bottom_force_z", "bottom_particle_count", "formula"],
+        [
+            "time",
+            "load_time",
+            "input_time_shift",
+            "input_velocity",
+            "input_traction",
+            "total_input_force",
+            "total_dashpot_force_particle_x",
+            "total_dashpot_force_grid_x",
+            "total_dashpot_force_x",
+            "total_dashpot_force_z",
+            "total_bottom_force_x",
+            "total_bottom_force_z",
+            "bottom_particle_count",
+            "formula",
+        ],
         boundary.bottom_rows,
     )
     write_csv(
@@ -908,6 +1504,37 @@ def main() -> None:
             "formula",
         ],
         boundary.side_rows,
+    )
+    write_csv(
+        RUN_DIR / "grid_side_pair_check.csv",
+        [
+            "pair_id",
+            "side",
+            "main_node",
+            "ff_node",
+            "main_body_id",
+            "ff_body_id",
+            "main_node_x",
+            "main_node_z",
+            "ff_node_x",
+            "ff_node_z",
+            "area",
+        ],
+        boundary.grid_side_specs,
+    )
+    write_csv(
+        RUN_DIR / "grid_bottom_node_check.csv",
+        [
+            "particle_id",
+            "body_id",
+            "node_id",
+            "particle_x",
+            "particle_z",
+            "node_x",
+            "node_z",
+            "area",
+        ],
+        boundary.grid_bottom_specs,
     )
     metric_rows = write_history_and_figure(boundary)
     write_reflection_history_and_report(boundary)
