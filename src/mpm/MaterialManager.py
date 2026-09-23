@@ -4,6 +4,7 @@ from src.mpm.materials.finite_strain.HenckyElastic import HenckyElastic
 from src.mpm.materials.finite_strain.NeoHookean import NeoHookean
 from src.mpm.materials.infinitesimal_strain.LinearElastic import LinearElastic
 from src.mpm.materials.infinitesimal_strain.ElasticPerfectlyPlastic import ElasticPerfectlyPlastic
+from src.mpm.materials.infinitesimal_strain.VonMisesSoftening import VonMisesSoftening
 from src.mpm.materials.infinitesimal_strain.IsotropicHardeningPlastic import IsotropicHardeningPlastic
 from src.mpm.materials.infinitesimal_strain.WillianMohrCoulomb import WillianMohrCoulomb
 from src.mpm.materials.infinitesimal_strain.MohrCoulomb import MohrCoulomb
@@ -29,7 +30,7 @@ class ConstitutiveModel:
     def initialize(self, sims: Simulation):
         if sims.material_type == "Solid" or sims.material_type == "TwoPhaseDoubleLayer":
             model_type = ["None", "RigidBoyd", "LinearElastic", "HenckyElastic", "NeoHookean", "ElasticPerfectlyPlastic", "IsotropicHardeningPlastic",
-                          "MohrCoulomb", "SoftenMohrCoulomb", "DruckerPrager", "ModifiedCamClay", "CohesiveModifiedCamClay", "SoilStructureInteraction", "UserDefined"]
+                          "VonMisesSoftening", "MohrCoulomb", "SoftenMohrCoulomb", "DruckerPrager", "ModifiedCamClay", "CohesiveModifiedCamClay", "SoilStructureInteraction", "UserDefined"]
             if self.constitutive_model == "None" or self.constitutive_model == "RigidBody":
                 return RigidBody(sims)
             elif self.constitutive_model == "HenckyElastic":
@@ -46,6 +47,8 @@ class ConstitutiveModel:
                 return ElasticPerfectlyPlastic(sims)
             elif self.constitutive_model == "IsotropicHardeningPlastic":
                 return IsotropicHardeningPlastic(sims)
+            elif self.constitutive_model == "VonMisesSoftening":
+                return VonMisesSoftening(sims)
             elif self.constitutive_model == "MohrCoulomb":
                 return WillianMohrCoulomb(sims)
             elif self.constitutive_model == "SoftenMohrCoulomb":
@@ -90,5 +93,4 @@ class ConstitutiveModel:
                 return LinearElastic(sims)
             else:
                 raise ValueError(f'Constitutive Model: {self.constitutive_model} error! Only the following is aviliable:\n{model_type}')
-
 

@@ -67,7 +67,17 @@ class ULExplicitEngine(Engine):
         kernel_assemble_contact_force(scene.mass_cut_off, sims.dt, scene.node)
 
     def compute_contact_force(self, sims: Simulation, scene: myScene):
-        kernel_calc_friction_contact(scene.mass_cut_off, scene.contact.friction, sims.dt, scene.is_rigid, scene.node)
+        body_id1 = int(getattr(scene.contact, "body_id1", 0))
+        body_id2 = int(getattr(scene.contact, "body_id2", 1))
+        kernel_calc_friction_contact(
+            scene.mass_cut_off,
+            scene.contact.friction,
+            sims.dt,
+            scene.is_rigid,
+            scene.node,
+            body_id1,
+            body_id2,
+        )
         self.apply_contact_velocity_constraints(sims, scene)
         self.apply_contact_reflection_constraints(sims, scene)
         kernel_assemble_contact_force(scene.mass_cut_off, sims.dt, scene.node)

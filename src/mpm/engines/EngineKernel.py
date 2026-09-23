@@ -1958,10 +1958,18 @@ def kernel_assemble_contact_force(cutoff: float, dt: ti.template(), node: ti.tem
 
 ################## MPM contact ##################
 @ti.kernel
-def kernel_calc_friction_contact(cut_off: float, mu: float, dt: ti.template(), is_rigid: ti.template(), node: ti.template()):
+def kernel_calc_friction_contact(
+    cut_off: float,
+    mu: float,
+    dt: ti.template(),
+    is_rigid: ti.template(),
+    node: ti.template(),
+    body_id1: ti.i32,
+    body_id2: ti.i32,
+):
     # ti.block_local(dt)
     for ng in range(node.shape[0]):
-        bodyID1, bodyID2 = 0, 1
+        bodyID1, bodyID2 = body_id1, body_id2
         m1, m2 = node[ng, bodyID1].m, node[ng, bodyID2].m
         if m1 > cut_off and m2 > cut_off:
             mv1, mv2 = m1 * node[ng, bodyID1].momentum, m2 * node[ng, bodyID2].momentum

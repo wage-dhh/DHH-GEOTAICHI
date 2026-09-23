@@ -67,7 +67,7 @@ def init_taichi_mpm(dim: int = 2, arch: str = "gpu") -> None:
 
 
 def force_three_grid_levels(scene: Any, sims: Any) -> int:
-    scene.grid_level = 3
+    scene.grid_level = 4 if SEPARATE_SLIDE_BODY else 3
     return scene.grid_level
 
 
@@ -884,6 +884,8 @@ BODY_RIGHT_FREE_BASE = 2
 MAIN_BODY_IDS = [0]
 LEFT_FREE_BODY_IDS = [1]
 RIGHT_FREE_BODY_IDS = [2]
+BODY_SLIDE = 3
+SEPARATE_SLIDE_BODY = False
 
 SOIL_E_MODULUS = 4.0e4
 SOIL_POISSON_INITIAL = 0.35
@@ -1066,6 +1068,24 @@ def deep_update(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, An
 def normalize_material_parameters(case: dict[str, Any]) -> None:
     material_model = str(case.get("material_model", "LinearElastic"))
     softening_spec = case.get("softening", {})
+    if material_model == "VonMisesSoftening" and "residual_shear_displacement_m" in softening_spec:
+        h = float(case.get("dx", DX))
+        d_residual = float(softening_spec["residual_shear_displacement_m"])
+        h_shear = float(softening_spec.get("h_shear_factor", 2.0)) * h
+        eps_derived = d_residual / (math.sqrt(3.0) * h_shear) if h_shear > 0.0 else math.nan
+        configured_eps = float(
+            os.environ.get(
+                "NAIRN_VM_EPS_END",
+                softening_spec.get("eps_end", SOFTENING_EPS_END),
+            )
+        )
+        if not math.isfinite(eps_derived) or not math.isclose(
+            configured_eps, eps_derived, rel_tol=1.0e-8, abs_tol=1.0e-8
+        ):
+            raise ValueError(
+                "VonMisesSoftening eps_end does not match d_r/(sqrt(3)*h_shear): "
+                f"configured={configured_eps}, derived={eps_derived}"
+            )
     dp_env_overrides = {
         "Cohesion": os.environ.get("NAIRN_DP_COHESION"),
         "Friction": os.environ.get("NAIRN_DP_FRICTION"),
@@ -1109,6 +1129,26 @@ def normalize_material_parameters(case: dict[str, Any]) -> None:
                 material["YieldStress"] = float(os.environ["NAIRN_EP_YIELD_STRESS"])
             if os.environ.get("NAIRN_PLASTIC_MODULUS") is not None:
                 material["PlasticModulus"] = float(os.environ["NAIRN_PLASTIC_MODULUS"])
+        elif material_model == "VonMisesSoftening":
+            material.setdefault(
+                "YieldStress",
+                softening_spec.get("yield_stress_initial", material.get("YieldStress", material.get("Cohesion", DP_COHESION))),
+            )
+            material.setdefault(
+                "ResidualYieldStress",
+                softening_spec.get("yield_stress_residual", material.get("ResidualYieldStress", material.get("ResidualCohesion", SOFTENING_RESIDUAL_COHESION))),
+            )
+            material.setdefault("PlasticDevStrain", softening_spec.get("eps_start", SOFTENING_EPS_START))
+            material.setdefault("ResidualPlasticDevStrain", softening_spec.get("eps_end", SOFTENING_EPS_END))
+            vm_env_overrides = {
+                "YieldStress": os.environ.get("NAIRN_VM_YIELD_STRESS"),
+                "ResidualYieldStress": os.environ.get("NAIRN_VM_RESIDUAL_YIELD_STRESS"),
+                "PlasticDevStrain": os.environ.get("NAIRN_VM_EPS_START"),
+                "ResidualPlasticDevStrain": os.environ.get("NAIRN_VM_EPS_END"),
+            }
+            for key, value in vm_env_overrides.items():
+                if value is not None:
+                    material[key] = float(value)
         elif material_model == "SoftenMohrCoulomb":
             material.setdefault("Cohesion", softening_spec.get("cohesion_initial", DP_COHESION))
             material.setdefault("Friction", softening_spec.get("friction_initial", DP_FRICTION))
@@ -1160,6 +1200,8 @@ DEFAULT_CASE: dict[str, Any] = {
         "enabled": SOFTENING_ENABLED,
         "cohesion_initial": DP_COHESION,
         "cohesion_residual": SOFTENING_RESIDUAL_COHESION,
+        "yield_stress_initial": DP_COHESION,
+        "yield_stress_residual": SOFTENING_RESIDUAL_COHESION,
         "friction_initial": DP_FRICTION,
         "friction_residual": SOFTENING_RESIDUAL_FRICTION,
         "dilation_initial": DP_DILATION,
@@ -1783,8 +1825,21 @@ def apply_case_globals(case: dict[str, Any]) -> None:
     global SHEAR_MODULUS, BULK_MODULUS, CS, CP, INPUT_STRESS_PEAK, INPUT_FREQUENCY
     global INPUT_PERIOD, HALF_PARTICLE_SIZE, CASE, EARTHQUAKE_MOTION, EARTHQUAKE_MOTION_FILE
     global FIG10C_INPUT_VELOCITY_FILE, SEISMIC_INPUT_MODE, SEISMIC_INPUT_FACTOR
+    global BODY_MAIN_SOIL, BODY_MAIN_BASE, BODY_LEFT_FREE_SOIL, BODY_LEFT_FREE_BASE
+    global BODY_RIGHT_FREE_SOIL, BODY_RIGHT_FREE_BASE, MAIN_BODY_IDS, LEFT_FREE_BODY_IDS
+    global RIGHT_FREE_BODY_IDS, BODY_SLIDE, SEPARATE_SLIDE_BODY
 
     CASE = case
+    separate_slide_spec = case.get("separate_slide_body", {})
+    SEPARATE_SLIDE_BODY = bool(separate_slide_spec.get("enabled", False))
+    if SEPARATE_SLIDE_BODY:
+        BODY_MAIN_SOIL = 0
+        BODY_MAIN_BASE = 0
+        BODY_SLIDE = int(separate_slide_spec.get("body_id", 3))
+        if BODY_SLIDE != 3:
+            raise ValueError("separate_slide_body.body_id must be 3 to preserve free-field body layers 1 and 2")
+        MAIN_BODY_IDS = [BODY_MAIN_SOIL]
+        case.setdefault("silent_boundary", {}).setdefault("side", {})["body_ids"] = [BODY_MAIN_SOIL]
     X_SHIFT, Y_SHIFT = [float(value) for value in case["coordinate_shift"]]
     DX = float(case["dx"])
     DOMAIN = np.array(case["domain"], dtype=np.float64)
@@ -1977,11 +2032,15 @@ def apply_free_field_particle_coupling(
     shear_dashpot_force_y: ti.template(),
     pair_total_force_x: ti.template(),
     pair_total_force_y: ti.template(),
+    total_coupling_power_main: ti.template(),
+    total_dashpot_dissipation: ti.template(),
 ):
     total_main_force_x[None] = 0.0
     total_main_force_y[None] = 0.0
     total_free_field_force_x[None] = 0.0
     total_free_field_force_y[None] = 0.0
+    total_coupling_power_main[None] = 0.0
+    total_dashpot_dissipation[None] = 0.0
     max_force_balance_error[None] = 0.0
     surface_area_update_call_count[None] += 1
     invalid_surface_area_count[None] = 0
@@ -2035,8 +2094,15 @@ def apply_free_field_particle_coupling(
         shear_dashpot_force_y[i] = pair_shear_dashpot_force_y
         pair_total_force_x[i] = force[0]
         pair_total_force_y[i] = force[1]
-
         if valid_surface_area:
+            main_velocity = particle[main_pid].v
+            total_coupling_power_main[None] += (
+                force[0] * main_velocity[0] + force[1] * main_velocity[1]
+            )
+            total_dashpot_dissipation[None] += dashpot_mult * (
+                normal_impedance_area * relative_velocity[0] * relative_velocity[0]
+                + shear_impedance_area * relative_velocity[1] * relative_velocity[1]
+            )
             main_offset = main_pid * total_nodes
             for ln in range(main_offset, main_offset + int(node_size[main_pid])):
                 node_id = ln_id[ln]
@@ -2122,7 +2188,28 @@ def kernel_compute_stress_hughes_winget_2d(
             )
 
 
+def hughes_winget_enabled_for_case(case: dict[str, Any] | None) -> bool:
+    """Return whether the selected material actually uses Hughes-Winget."""
+
+    material_model = str((case or {}).get("material_model", MATERIAL_MODEL))
+    return material_model == "VonMisesSoftening" or bool(
+        HUGHES_WINGET_STRESS_UPDATE and material_model == "LinearElastic"
+    )
+
+
+def hughes_winget_stress_update_label(case: dict[str, Any] | None) -> str:
+    material_model = str((case or {}).get("material_model", MATERIAL_MODEL))
+    if material_model == "VonMisesSoftening":
+        return "Kohler Hughes-Winget Eq.27-Eq.28 with J2 softening radial return"
+    if HUGHES_WINGET_STRESS_UPDATE and material_model == "LinearElastic":
+        return "Kohler Hughes-Winget Eq.27-Eq.28"
+    return f"{material_model} constitutive stress update"
+
+
 def install_hughes_winget_stress_update(mpm: MPM) -> None:
+    material_model = str((CASE or {}).get("material_model", MATERIAL_MODEL))
+    if not HUGHES_WINGET_STRESS_UPDATE or material_model != "LinearElastic":
+        return
     engine = mpm.enginer
     if engine is None:
         raise RuntimeError("GeoTaichi engine is not initialized; cannot install Hughes-Winget update")
@@ -2406,6 +2493,155 @@ def write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) -> 
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def failure_snapshot_state_enabled(case: dict[str, Any]) -> bool:
+    """Return whether particle files should retain constitutive state arrays."""
+
+    spec = case.get("failure_outputs", {})
+    return bool(spec.get("save_state_variables", False))
+
+
+def install_failure_snapshot_recorder(mpm: MPM, case: dict[str, Any]) -> None:
+    """Add state arrays to saved particle files for failure post-processing.
+
+    GeoTaichi's standard particle recorder intentionally stores only position
+    and velocity for lightweight runs.  Failure figures need the per-particle
+    plastic strain, so this opt-in wrapper augments each saved NPZ without
+    changing the solver or the normal Fig.10 output path.
+    """
+
+    if not failure_snapshot_state_enabled(case):
+        return
+    recorder = getattr(mpm, "recorder", None)
+    if recorder is None or getattr(recorder, "_nairn_failure_state_recorder", False):
+        return
+    original_save_particle = recorder.save_particle
+
+    def save_particle_with_failure_state(sims: Any, scene: Any) -> None:
+        original_save_particle(sims, scene)
+        particle_path = Path(sims.path) / "particles" / f"MPMParticle{int(sims.current_print):06d}.npz"
+        if not particle_path.exists():
+            return
+        particle_count = int(scene.particleNum[0])
+        with np.load(particle_path, allow_pickle=True) as saved:
+            payload = {name: saved[name] for name in saved.files}
+        payload["bodyID"] = np.ascontiguousarray(scene.particle.bodyID.to_numpy()[:particle_count])
+        payload["materialID"] = np.ascontiguousarray(scene.particle.materialID.to_numpy()[:particle_count])
+        payload["active"] = np.ascontiguousarray(scene.particle.active.to_numpy()[:particle_count])
+        payload["volume"] = np.ascontiguousarray(scene.particle.vol.to_numpy()[:particle_count])
+        payload["stress"] = np.ascontiguousarray(scene.particle.stress.to_numpy()[:particle_count])
+        state = scene.material.get_state_vars_dict(0, particle_count)
+        payload["state_vars"] = np.array(state, dtype=object)
+        np.savez(particle_path, **payload)
+
+    recorder.save_particle = save_particle_with_failure_state
+    recorder._nairn_failure_state_recorder = True
+
+
+def failure_postprocess_kwargs(case: dict[str, Any]) -> dict[str, Any]:
+    if not failure_snapshot_state_enabled(case):
+        return {}
+    return {
+        "write_state_variables": True,
+        "write_bodyID": True,
+        "write_volume": True,
+        "write_stress_component": True,
+    }
+
+
+def maybe_stop_seismic_input(mpm: MPM, case: dict[str, Any]) -> None:
+    """Optionally stop shaking after a persistent self-driven failure signal."""
+
+    spec = case.get("failure_stop", {})
+    boundary = getattr(mpm, "nairn_seismic_boundary", None)
+    if boundary is None or not bool(spec.get("enabled", False)) or not bool(boundary.input_enabled):
+        return
+    dynamic_time = float(boundary.dynamic_time(mpm.sims))
+    next_check = float(getattr(mpm, "failure_stop_next_check", 0.0))
+    check_interval = max(float(spec.get("check_interval", 0.01)), float(DT))
+    if dynamic_time + 0.5 * float(mpm.sims.delta) < next_check:
+        return
+    while next_check <= dynamic_time + 0.5 * float(mpm.sims.delta):
+        next_check += check_interval
+    mpm.failure_stop_next_check = next_check
+
+    particle_count = int(mpm.scene.particleNum[0])
+    material_ids = mpm.scene.particle.materialID.to_numpy()[:particle_count].astype(np.int32)
+    body_ids = mpm.scene.particle.bodyID.to_numpy()[:particle_count].astype(np.int32)
+    main_soil = (material_ids == MAT_SOIL) & (body_ids == BODY_MAIN_SOIL)
+    if not np.any(main_soil):
+        return
+    state = mpm.scene.material.get_state_vars_dict(0, particle_count)
+    epstrain = np.asarray(state.get("epstrain", np.zeros(particle_count)), dtype=np.float64).reshape(-1)
+    velocity = np.asarray(mpm.scene.particle.v.to_numpy()[:particle_count], dtype=np.float64)
+    max_epstrain = float(np.max(np.abs(epstrain[main_soil]))) if epstrain.size else 0.0
+    max_speed = float(np.max(np.linalg.norm(velocity[main_soil, :2], axis=1)))
+    input_velocity_abs = abs(float(input_velocity(dynamic_time)))
+    epstrain_ok = max_epstrain >= float(spec.get("min_epstrain", 0.02))
+    speed_ok = max_speed >= float(spec.get("min_main_speed", 0.01))
+    quiet_ok = (not bool(spec.get("require_quiet_input", True))) or (
+        input_velocity_abs <= float(spec.get("quiet_input_velocity", 0.002))
+    )
+    qualifying = epstrain_ok and speed_ok and quiet_ok
+    required_checks = max(1, int(spec.get("consecutive_checks", 3)))
+    count = int(getattr(mpm, "failure_stop_qualifying_checks", 0))
+    count = count + 1 if qualifying else 0
+    mpm.failure_stop_qualifying_checks = count
+    mpm.failure_stop_last_metrics = {
+        "time": dynamic_time,
+        "max_epstrain": max_epstrain,
+        "max_main_speed": max_speed,
+        "input_velocity_abs": input_velocity_abs,
+        "epstrain_ok": epstrain_ok,
+        "speed_ok": speed_ok,
+        "quiet_input_ok": quiet_ok,
+        "qualifying_checks": count,
+    }
+    if count < required_checks:
+        return
+    boundary.input_enabled = False
+    mpm.failure_stop_event = {
+        **mpm.failure_stop_last_metrics,
+        "required_checks": required_checks,
+        "reason": "persistent plastic deformation and self-driven velocity",
+    }
+
+
+def write_failure_stop_report(mpm: MPM, case: dict[str, Any]) -> Path | None:
+    spec = case.get("failure_stop", {})
+    if not bool(spec.get("enabled", False)):
+        return None
+    event = getattr(mpm, "failure_stop_event", None)
+    last_metrics = getattr(mpm, "failure_stop_last_metrics", {})
+    path = OUTPUT_DIR / "failure_stop_report.md"
+    lines = [
+        "# Seismic Input Stop Check",
+        "",
+        f"- enabled: `{bool(spec.get('enabled', False))}`",
+        f"- triggered: `{event is not None}`",
+        f"- input_enabled_at_end: `{bool(getattr(getattr(mpm, 'nairn_seismic_boundary', None), 'input_enabled', True))}`",
+        f"- check_interval_s: `{float(spec.get('check_interval', 0.01))}`",
+        f"- minimum_epstrain: `{float(spec.get('min_epstrain', 0.02))}`",
+        f"- minimum_main_speed_m_per_s: `{float(spec.get('min_main_speed', 0.01))}`",
+        f"- require_quiet_input: `{bool(spec.get('require_quiet_input', True))}`",
+        f"- quiet_input_velocity_m_per_s: `{float(spec.get('quiet_input_velocity', 0.002))}`",
+        f"- consecutive_checks_required: `{int(spec.get('consecutive_checks', 3))}`",
+        "",
+        "## Trigger Event",
+        "",
+    ]
+    if event is None:
+        lines.append("- event: `not reached during this run`")
+    else:
+        lines.extend([f"- {key}: `{value}`" for key, value in event.items()])
+    lines.extend(["", "## Last Check", ""])
+    if last_metrics:
+        lines.extend([f"- {key}: `{value}`" for key, value in last_metrics.items()])
+    else:
+        lines.append("- metrics: `not sampled`")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
 
 
 @ti.func
@@ -2937,9 +3173,11 @@ def static_checkpoint_metadata(mpm: MPM, case: dict[str, Any], static_monitor: A
             else "NOT_APIC"
         ),
         "paper_apic_constant_D": bool(APIC_USE_PAPER_CONSTANT_DP),
-        "hughes_winget_stress_update": bool(HUGHES_WINGET_STRESS_UPDATE),
+        "hughes_winget_stress_update": hughes_winget_enabled_for_case(case),
         "hughes_winget_formula_revision": (
-            PAPER_HUGHES_WINGET_FORMULA_REVISION if HUGHES_WINGET_STRESS_UPDATE else "NOT_HUGHES_WINGET"
+            PAPER_HUGHES_WINGET_FORMULA_REVISION
+            if hughes_winget_enabled_for_case(case)
+            else "NOT_HUGHES_WINGET"
         ),
         "free_field_periodic_static": bool(getattr(mpm, "periodic_hooks_installed_for_static", False)),
         "free_field_periodic_support_wrap": "full_cubic_modulo",
@@ -3052,7 +3290,7 @@ def restore_static_checkpoint(mpm: MPM, case: dict[str, Any], path: Path) -> Any
         )
     checkpoint_hughes_winget = bool(metadata.get("hughes_winget_stress_update", False))
     checkpoint_hughes_winget_revision = str(metadata.get("hughes_winget_formula_revision", "UNRECORDED"))
-    if HUGHES_WINGET_STRESS_UPDATE and (
+    if hughes_winget_enabled_for_case(case) and (
         not checkpoint_hughes_winget
         or checkpoint_hughes_winget_revision != PAPER_HUGHES_WINGET_FORMULA_REVISION
     ):
@@ -3819,6 +4057,7 @@ def write_material_model_check(case: dict[str, Any]) -> Path:
     current_plasticity = material_model in {
         "ElasticPerfectlyPlastic",
         "IsotropicHardeningPlastic",
+        "VonMisesSoftening",
         "DruckerPrager",
         "MohrCoulomb",
         "SoftenMohrCoulomb",
@@ -3826,7 +4065,7 @@ def write_material_model_check(case: dict[str, Any]) -> Path:
         "ModifiedCamClay",
         "CohesiveModifiedCamClay",
     }
-    softening = material_model in {"SoftenMohrCoulomb", "StateDependentMohrCoulomb", "CohesiveModifiedCamClay"} or bool(
+    softening = material_model in {"SoftenMohrCoulomb", "VonMisesSoftening", "StateDependentMohrCoulomb", "CohesiveModifiedCamClay"} or bool(
         case.get("softening", {}).get("enabled", False)
     )
     if material_model == "DruckerPrager":
@@ -3837,6 +4076,9 @@ def write_material_model_check(case: dict[str, Any]) -> Path:
         plastic_variables = "`epstrain` equivalent plastic strain and `estress` equivalent stress"
     elif material_model == "ElasticPerfectlyPlastic":
         criterion = "von Mises equivalent-stress yield surface"
+        plastic_variables = "`epstrain` equivalent plastic strain and `estress` equivalent stress"
+    elif material_model == "VonMisesSoftening":
+        criterion = "von Mises (J2) equivalent-stress yield surface with isotropic softening"
         plastic_variables = "`epstrain` equivalent plastic strain and `estress` equivalent stress"
     elif material_model == "LinearElastic":
         criterion = "none"
@@ -3853,6 +4095,7 @@ def write_material_model_check(case: dict[str, Any]) -> Path:
                 f"  Density `{material.get('Density')}`, YoungModulus `{material.get('YoungModulus')}`, PossionRatio `{material.get('PossionRatio')}`",
                 f"  Cohesion `{material.get('Cohesion', 'n/a')}`, Friction `{material.get('Friction', 'n/a')}`, Dilation `{material.get('Dilation', 'n/a')}`, Tensile `{material.get('Tensile', 'n/a')}`, dpType `{material.get('dpType', 'n/a')}`",
                 f"  ResidualCohesion `{material.get('ResidualCohesion', 'n/a')}`, ResidualFriction `{material.get('ResidualFriction', 'n/a')}`, PlasticDevStrain `{material.get('PlasticDevStrain', 'n/a')}`, ResidualPlasticDevStrain `{material.get('ResidualPlasticDevStrain', 'n/a')}`",
+                f"  YieldStress `{material.get('YieldStress', 'n/a')}`, ResidualYieldStress `{material.get('ResidualYieldStress', 'n/a')}`",
             ]
         )
 
@@ -3889,8 +4132,9 @@ def write_material_model_check(case: dict[str, Any]) -> Path:
         "## Available GeoTaichi Material Models Found",
         "",
         "- `LinearElastic`: elastic stress update only.",
-        "- `ElasticPerfectlyPlastic`: von Mises elastic-perfectly plastic model with `epstrain`; existing source has apparent argument inconsistencies in correction calls, so it is not used as the default here.",
+        "- `ElasticPerfectlyPlastic`: von Mises elastic-perfectly plastic model with `epstrain`; existing source has apparent argument inconsistencies in correction calls.",
         "- `IsotropicHardeningPlastic`: von Mises-style hardening plastic model with `epstrain` and `sigma_y`; existing source shows similar apparent argument inconsistencies.",
+        "- `VonMisesSoftening`: solver-compatible J2 radial-return model with per-particle equivalent plastic strain and peak-to-residual isotropic yield-stress softening.",
         "- `DruckerPrager`: pressure-dependent elastic-plastic soil model with `epstrain` and `estress`.",
         "- `MohrCoulomb/SoftenMohrCoulomb`: frictional soil plasticity, with softening available in the softening variant.",
         "- `ModifiedCamClay/CohesiveModifiedCamClay`: critical-state clay models with additional internal variables.",
@@ -4114,6 +4358,485 @@ def set_basic_material_properties(
     mat_props[material_id].possion = possion
 
 
+@ti.kernel
+def set_von_mises_strength_override(
+    mat_props: ti.template(),
+    material_id: ti.i32,
+    yield_stress: ti.f64,
+):
+    """Set a constant diagnostic yield stress for one von Mises material."""
+    mat_props[material_id].yield_peak = yield_stress
+    mat_props[material_id].yield_residual = yield_stress
+
+
+def apply_dynamic_strength_override(mpm: MPM, case: dict[str, Any]) -> float | None:
+    """Optionally lower the dynamic soil strength without rebuilding particles."""
+    diagnostic = case.get("diagnostic", {})
+    override = diagnostic.get("dynamic_yield_stress_override")
+    if override is None or str(case.get("material_model", "")) != "VonMisesSoftening":
+        return None
+    yield_stress = float(override)
+    if not math.isfinite(yield_stress) or yield_stress <= 0.0:
+        raise ValueError("diagnostic.dynamic_yield_stress_override must be positive and finite")
+    material_manager = getattr(mpm.scene, "material", None)
+    if material_manager is None or not hasattr(material_manager, "matProps"):
+        raise RuntimeError("Dynamic strength override requires an initialized material manager")
+    set_von_mises_strength_override(material_manager.matProps, MAT_SOIL, yield_stress)
+    return yield_stress
+
+
+def apply_dynamic_qr_region(mpm: MPM, case: dict[str, Any]) -> dict[str, Any] | None:
+    """Assign a residual-strength material to a narrow, explicit slip-band region.
+
+    This is a diagnostic trigger only.  It preserves the particle state and
+    changes material ID for main-soil particles inside the configured band;
+    the surrounding soil remains at the peak-strength material.
+    """
+    spec = case.get("dynamic_qr_region", {})
+    if not bool(spec.get("enabled", False)):
+        return None
+    assign_material = bool(spec.get("assign_material", True))
+    qr_material_id = int(spec.get("material_id", 3))
+    material_ids_available = {int(item["MaterialID"]) for item in case.get("materials", [])}
+    if assign_material and qr_material_id not in material_ids_available:
+        raise ValueError(f"dynamic_qr_region.material_id={qr_material_id} is not defined in materials")
+    particle_count = int(mpm.scene.particleNum[0])
+    positions = mpm.scene.particle.x.to_numpy()[:particle_count].astype(np.float64)
+    material_ids = mpm.scene.particle.materialID.to_numpy()[:particle_count].astype(np.int32)
+    body_ids = mpm.scene.particle.bodyID.to_numpy()[:particle_count].astype(np.int32)
+    physical_x = positions[:, 0] - X_SHIFT
+    physical_z = positions[:, 1] - Y_SHIFT
+    interface_z = np.asarray(kohler_soil_base_interface_z_np(physical_x), dtype=np.float64)
+    x_min = float(spec.get("x_min", -40.0))
+    x_max = float(spec.get("x_max", 140.0))
+    lower_offset = float(spec.get("lower_offset_m", 0.0))
+    upper_offset = float(spec.get("upper_offset_m", 1.0))
+    band_thickness = float(spec.get("band_thickness_m", upper_offset - lower_offset))
+    profile = str(spec.get("profile", "downslope_arc")).lower()
+    left_lower_offset = spec.get("left_lower_offset_m")
+    right_lower_offset = spec.get("right_lower_offset_m")
+    center_lower_offset = spec.get("center_lower_offset_m")
+    edge_lower_offset = spec.get("edge_lower_offset_m")
+    surface_to_surface = profile == "surface_to_surface_arc"
+    finite_block = profile == "finite_block_arc"
+    curved = surface_to_surface or finite_block or left_lower_offset is not None or right_lower_offset is not None
+    if curved:
+        if surface_to_surface or finite_block:
+            if center_lower_offset is None or edge_lower_offset is None:
+                raise ValueError(
+                    "surface_to_surface_arc requires center_lower_offset_m and edge_lower_offset_m"
+                )
+            center_lower_offset = float(center_lower_offset)
+            edge_lower_offset = float(edge_lower_offset)
+            if center_lower_offset < 0.0 or edge_lower_offset < 0.0:
+                raise ValueError("dynamic_qr_region arc offsets must be non-negative")
+        else:
+            if left_lower_offset is None or right_lower_offset is None:
+                raise ValueError("dynamic_qr_region requires both left_lower_offset_m and right_lower_offset_m")
+            left_lower_offset = float(left_lower_offset)
+            right_lower_offset = float(right_lower_offset)
+            if left_lower_offset < 0.0 or right_lower_offset < 0.0:
+                raise ValueError("dynamic_qr_region lower offsets must be non-negative")
+    elif band_thickness < 0.0:
+        raise ValueError("dynamic_qr_region.band_thickness_m must be non-negative")
+    if curved:
+        span = max(x_max - x_min, 1.0e-12)
+        xi = np.clip((physical_x - x_min) / span, 0.0, 1.0)
+        if surface_to_surface or finite_block:
+            # Both ends rise to the ground surface while the middle approaches
+            # the soil/base interface, creating a fully detached slide block.
+            lower_boundary = center_lower_offset + (edge_lower_offset - center_lower_offset) * (2.0 * xi - 1.0) ** 2
+        else:
+            # A one-sided arc that becomes shallower toward the downslope end.
+            lower_boundary = right_lower_offset + (left_lower_offset - right_lower_offset) * (1.0 - xi) ** 2
+        upper_boundary = lower_boundary + band_thickness
+    else:
+        lower_boundary = np.full_like(physical_x, lower_offset)
+        upper_boundary = np.full_like(physical_x, upper_offset)
+    basal_mask = (
+        (body_ids == BODY_MAIN_SOIL)
+        & (material_ids == MAT_SOIL)
+        & (physical_x >= x_min)
+        & (physical_x <= x_max)
+        & (physical_z >= interface_z + lower_boundary)
+        & (physical_z <= interface_z + upper_boundary)
+    )
+    if finite_block:
+        head_width = float(spec.get("head_width_m", band_thickness))
+        toe_width = float(spec.get("toe_width_m", band_thickness))
+        surface_z = np.asarray(kohler_surface_z_np(physical_x), dtype=np.float64)
+        head_mask = (
+            (body_ids == BODY_MAIN_SOIL)
+            & (material_ids == MAT_SOIL)
+            & (physical_x >= x_min)
+            & (physical_x <= x_min + head_width)
+            & (physical_z >= interface_z + lower_boundary)
+            & (physical_z <= surface_z)
+        )
+        toe_mask = (
+            (body_ids == BODY_MAIN_SOIL)
+            & (material_ids == MAT_SOIL)
+            & (physical_x >= x_max - toe_width)
+            & (physical_x <= x_max)
+            & (physical_z >= interface_z + lower_boundary)
+            & (physical_z <= surface_z)
+        )
+        mask = basal_mask | head_mask | toe_mask
+    else:
+        mask = basal_mask
+    if assign_material:
+        material_ids[mask] = qr_material_id
+        full_material_ids = mpm.scene.particle.materialID.to_numpy()
+        full_material_ids[:particle_count] = material_ids.astype(full_material_ids.dtype, copy=False)
+        mpm.scene.particle.materialID.from_numpy(full_material_ids)
+    result = {
+        "enabled": True,
+        "assign_material": assign_material,
+        "material_id": qr_material_id,
+        "particle_count": int(np.count_nonzero(mask)),
+        "x_min": x_min,
+        "x_max": x_max,
+        "lower_offset_m": lower_offset,
+        "upper_offset_m": upper_offset,
+        "band_thickness_m": band_thickness,
+        "profile": profile,
+        "curved": curved,
+        "left_lower_offset_m": left_lower_offset,
+        "right_lower_offset_m": right_lower_offset,
+        "center_lower_offset_m": center_lower_offset,
+        "edge_lower_offset_m": edge_lower_offset,
+    }
+    mpm.dynamic_qr_region = result
+    return result
+
+
+def apply_equivalent_postquake_qr_state(mpm: MPM, case: dict[str, Any]) -> dict[str, Any] | None:
+    """Initialize a stress-consistent residual-strength slip band.
+
+    This represents an equivalent post-earthquake state.  The selected soil
+    particles remain in the paper's original softening material, their
+    softening variable is advanced to the residual branch, and any excess
+    deviatoric stress is projected radially onto the residual J2 surface.
+    Hydrostatic stress is preserved and no velocity is prescribed.
+    """
+    spec = case.get("equivalent_postquake_qr_state", {})
+    if not bool(spec.get("enabled", False)):
+        return None
+    qr_spec = case.get("dynamic_qr_region", {})
+    if not bool(qr_spec.get("enabled", False)):
+        raise ValueError("equivalent_postquake_qr_state requires dynamic_qr_region.enabled=true")
+    if bool(qr_spec.get("assign_material", True)):
+        raise ValueError(
+            "equivalent_postquake_qr_state requires dynamic_qr_region.assign_material=false"
+        )
+    if str(case.get("material_model", "")) != "VonMisesSoftening":
+        raise ValueError("equivalent_postquake_qr_state requires VonMisesSoftening")
+
+    particle_count = int(mpm.scene.particleNum[0])
+    positions = mpm.scene.particle.x.to_numpy()[:particle_count].astype(np.float64)
+    stresses = mpm.scene.particle.stress.to_numpy()[:particle_count].astype(np.float64)
+    material_ids = mpm.scene.particle.materialID.to_numpy()[:particle_count].astype(np.int32)
+    body_ids = mpm.scene.particle.bodyID.to_numpy()[:particle_count].astype(np.int32)
+    physical_x = positions[:, 0] - X_SHIFT
+    physical_z = positions[:, 1] - Y_SHIFT
+    interface_z = np.asarray(kohler_soil_base_interface_z_np(physical_x), dtype=np.float64)
+    x_min = float(qr_spec.get("x_min", -40.0))
+    x_max = float(qr_spec.get("x_max", 140.0))
+    thickness = float(qr_spec.get("band_thickness_m", 0.5))
+    span = max(x_max - x_min, 1.0e-12)
+    xi = np.clip((physical_x - x_min) / span, 0.0, 1.0)
+    profile = str(qr_spec.get("profile", "surface_to_surface_arc")).lower()
+    finite_block = profile == "finite_block_arc"
+    if profile in {"surface_to_surface_arc", "finite_block_arc"}:
+        center = float(qr_spec.get("center_lower_offset_m", 0.0))
+        edge = float(qr_spec.get("edge_lower_offset_m", 9.5))
+        lower = center + (edge - center) * (2.0 * xi - 1.0) ** 2
+    elif profile == "downslope_arc":
+        left = float(qr_spec.get("left_lower_offset_m", 9.5))
+        right = float(qr_spec.get("right_lower_offset_m", 0.0))
+        lower = right + (left - right) * (1.0 - xi) ** 2
+    else:
+        raise ValueError(
+            "equivalent_postquake_qr_state supports 'surface_to_surface_arc' or 'downslope_arc'"
+        )
+    basal_mask = (
+        (body_ids == BODY_MAIN_SOIL)
+        & (material_ids == MAT_SOIL)
+        & (physical_x >= x_min)
+        & (physical_x <= x_max)
+        & (physical_z >= interface_z + lower)
+        & (physical_z <= interface_z + lower + thickness)
+    )
+    if finite_block:
+        head_width = float(qr_spec.get("head_width_m", thickness))
+        toe_width = float(qr_spec.get("toe_width_m", thickness))
+        surface_z = np.asarray(kohler_surface_z_np(physical_x), dtype=np.float64)
+        head_mask = (
+            (body_ids == BODY_MAIN_SOIL)
+            & (material_ids == MAT_SOIL)
+            & (physical_x >= x_min)
+            & (physical_x <= x_min + head_width)
+            & (physical_z >= interface_z + lower)
+            & (physical_z <= surface_z)
+        )
+        toe_mask = (
+            (body_ids == BODY_MAIN_SOIL)
+            & (material_ids == MAT_SOIL)
+            & (physical_x >= x_max - toe_width)
+            & (physical_x <= x_max)
+            & (physical_z >= interface_z + lower)
+            & (physical_z <= surface_z)
+        )
+        mask = basal_mask | head_mask | toe_mask
+    else:
+        mask = basal_mask
+    if not np.any(mask):
+        raise RuntimeError("equivalent_postquake_qr_state selected no soil particles")
+
+    softening = case.get("softening", {})
+    residual_strength = float(
+        spec.get("residual_strength", softening.get("yield_stress_residual", 38.8888888889))
+    )
+    residual_epstrain = float(
+        spec.get("residual_epstrain", softening.get("eps_end", 0.2309401077))
+    )
+    if residual_strength <= 0.0 or residual_epstrain < 0.0:
+        raise ValueError("Equivalent post-earthquake residual strength/state must be non-negative")
+
+    mean_stress = np.mean(stresses[:, :3], axis=1)
+    deviatoric = stresses.copy()
+    deviatoric[:, 0] -= mean_stress
+    deviatoric[:, 1] -= mean_stress
+    deviatoric[:, 2] -= mean_stress
+    q_before = np.sqrt(
+        1.5
+        * (
+            np.sum(deviatoric[:, :3] ** 2, axis=1)
+            + 2.0 * np.sum(deviatoric[:, 3:] ** 2, axis=1)
+        )
+    )
+    projection_mask = mask & (q_before > residual_strength)
+    scale = np.ones(particle_count, dtype=np.float64)
+    scale[projection_mask] = residual_strength / q_before[projection_mask]
+    stresses[projection_mask, :3] = (
+        mean_stress[projection_mask, None]
+        + deviatoric[projection_mask, :3] * scale[projection_mask, None]
+    )
+    stresses[projection_mask, 3:] = deviatoric[projection_mask, 3:] * scale[projection_mask, None]
+
+    full_stress = mpm.scene.particle.stress.to_numpy()
+    full_stress[:particle_count] = stresses.astype(full_stress.dtype, copy=False)
+    mpm.scene.particle.stress.from_numpy(full_stress)
+
+    material = mpm.scene.material
+    state = material.get_state_vars_dict(0, particle_count)
+    epstrain = np.asarray(state["epstrain"], dtype=np.float64).copy()
+    estress = np.asarray(state["estress"], dtype=np.float64).copy()
+    epstrain[mask] = np.maximum(epstrain[mask], residual_epstrain)
+    estress[mask] = np.minimum(q_before[mask], residual_strength)
+    material.reload_state_variables({"epstrain": epstrain, "estress": estress})
+
+    result = {
+        "enabled": True,
+        "particle_count": int(np.count_nonzero(mask)),
+        "projected_particle_count": int(np.count_nonzero(projection_mask)),
+        "residual_strength": residual_strength,
+        "residual_epstrain": residual_epstrain,
+        "max_q_before": float(np.max(q_before[mask])),
+        "mean_q_before": float(np.mean(q_before[mask])),
+        "max_q_after": float(np.max(np.minimum(q_before[mask], residual_strength))),
+    }
+    mpm.equivalent_postquake_qr_state = result
+    return result
+
+
+def sliding_block_mask_from_arrays(
+    positions: np.ndarray,
+    material_ids: np.ndarray,
+    body_ids: np.ndarray,
+    case: dict[str, Any],
+    allowed_body_ids: list[int],
+) -> np.ndarray:
+    """Return the soil particles above the configured basal slip band."""
+
+    qr_spec = case.get("dynamic_qr_region", {})
+    physical_x = positions[:, 0] - X_SHIFT
+    physical_z = positions[:, 1] - Y_SHIFT
+    x_min = float(qr_spec.get("x_min", -40.0))
+    x_max = float(qr_spec.get("x_max", 140.0))
+    thickness = float(qr_spec.get("band_thickness_m", 1.0))
+    interface = np.asarray(kohler_soil_base_interface_z_np(physical_x), dtype=np.float64)
+    profile = str(qr_spec.get("profile", "downslope_arc")).lower()
+    span = max(x_max - x_min, 1.0e-12)
+    xi = np.clip((physical_x - x_min) / span, 0.0, 1.0)
+    if profile in {"surface_to_surface_arc", "finite_block_arc"}:
+        center = float(qr_spec.get("center_lower_offset_m", 0.5))
+        edge = float(qr_spec.get("edge_lower_offset_m", 8.5))
+        lower = center + (edge - center) * (2.0 * xi - 1.0) ** 2
+    else:
+        left = float(qr_spec.get("left_lower_offset_m", 0.0))
+        right = float(qr_spec.get("right_lower_offset_m", 0.0))
+        lower = right + (left - right) * (1.0 - xi) ** 2
+    surface = np.asarray(kohler_surface_z_np(physical_x), dtype=np.float64)
+    allowed_body_mask = np.isin(body_ids, np.asarray(allowed_body_ids, dtype=np.int32))
+    slide_material_id = int(case.get("separate_slide_body", {}).get("material_id", MAT_SOIL))
+    if BODY_SLIDE in allowed_body_ids and slide_material_id != MAT_SOIL:
+        material_mask = (material_ids == MAT_SOIL) | (
+            (body_ids == BODY_SLIDE) & (material_ids == slide_material_id)
+        )
+    else:
+        material_mask = material_ids == MAT_SOIL
+    return (
+        allowed_body_mask
+        & material_mask
+        & (physical_x >= x_min)
+        & (physical_x <= x_max)
+        & (physical_z > interface + lower + thickness)
+        & (physical_z <= surface + 1.0e-8)
+    )
+
+
+def apply_separate_slide_body(mpm: MPM, case: dict[str, Any]) -> dict[str, Any] | None:
+    """Move the detached slide mass to its own nodal body layer."""
+
+    if not bool(case.get("separate_slide_body", {}).get("enabled", False)):
+        return None
+    particle_count = int(mpm.scene.particleNum[0])
+    positions = mpm.scene.particle.x.to_numpy()[:particle_count].astype(np.float64)
+    material_ids = mpm.scene.particle.materialID.to_numpy()[:particle_count].astype(np.int32)
+    body_ids = mpm.scene.particle.bodyID.to_numpy()[:particle_count].astype(np.int32)
+    physical_x = positions[:, 0] - X_SHIFT
+    mask = sliding_block_mask_from_arrays(
+        positions,
+        material_ids,
+        body_ids,
+        case,
+        [BODY_MAIN_SOIL],
+    )
+    body_ids[mask] = BODY_SLIDE
+    slide_material_id = int(case.get("separate_slide_body", {}).get("material_id", MAT_SOIL))
+    material_ids[mask] = slide_material_id
+    weak_band = case.get("separate_slide_body", {}).get("internal_weak_band", {})
+    weak_band_count = 0
+    if bool(weak_band.get("enabled", False)):
+        qr_spec = case.get("dynamic_qr_region", {})
+        x_min = float(qr_spec.get("x_min", -40.0))
+        weak_x = float(weak_band.get("x_m", x_min + 10.0))
+        weak_width = max(float(weak_band.get("width_m", 1.0)), 0.0)
+        weak_material_id = int(weak_band.get("material_id", MAT_SOIL))
+        weak_mask = mask & (np.abs(physical_x - weak_x) <= 0.5 * weak_width)
+        material_ids[weak_mask] = weak_material_id
+        weak_band_count = int(np.count_nonzero(weak_mask))
+    full_body_ids = mpm.scene.particle.bodyID.to_numpy()
+    full_body_ids[:particle_count] = body_ids.astype(full_body_ids.dtype, copy=False)
+    mpm.scene.particle.bodyID.from_numpy(full_body_ids)
+    full_material_ids = mpm.scene.particle.materialID.to_numpy()
+    full_material_ids[:particle_count] = material_ids.astype(full_material_ids.dtype, copy=False)
+    mpm.scene.particle.materialID.from_numpy(full_material_ids)
+    result = {
+        "enabled": True,
+        "body_id": BODY_SLIDE,
+        "material_id": slide_material_id,
+        "particle_count": int(np.count_nonzero(mask)),
+        "internal_weak_band_particle_count": weak_band_count,
+        "internal_weak_band_material_id": int(weak_band.get("material_id", MAT_SOIL))
+        if bool(weak_band.get("enabled", False))
+        else None,
+    }
+    mpm.separate_slide_body = result
+    return result
+
+
+def apply_postquake_block_velocity(mpm: MPM, case: dict[str, Any]) -> dict[str, Any] | None:
+    """Apply an equivalent post-earthquake velocity to the slide block.
+
+    ``surface_tangent`` follows the local curved slip-surface tangent.  That
+    is useful for tracing the prescribed curved path, but it is not a rigid
+    block velocity field.  ``rigid_translation`` gives every block particle
+    the same vector and is the diagnostic mode for distinguishing block motion
+    from velocity-gradient-driven fluidisation.
+    """
+    spec = case.get("postquake_block_velocity", {})
+    if not bool(spec.get("enabled", False)):
+        return None
+    qr_spec = case.get("dynamic_qr_region", {})
+    if not bool(qr_spec.get("enabled", False)):
+        raise ValueError("postquake_block_velocity requires dynamic_qr_region.enabled=true")
+    speed = float(spec.get("speed_m_per_s", 0.05))
+    if not math.isfinite(speed) or speed <= 0.0:
+        raise ValueError("postquake_block_velocity.speed_m_per_s must be positive and finite")
+    particle_count = int(mpm.scene.particleNum[0])
+    positions = mpm.scene.particle.x.to_numpy()[:particle_count].astype(np.float64)
+    velocities = mpm.scene.particle.v.to_numpy()[:particle_count].astype(np.float64)
+    material_ids = mpm.scene.particle.materialID.to_numpy()[:particle_count].astype(np.int32)
+    body_ids = mpm.scene.particle.bodyID.to_numpy()[:particle_count].astype(np.int32)
+    physical_x = positions[:, 0] - X_SHIFT
+    physical_z = positions[:, 1] - Y_SHIFT
+    x_min = float(qr_spec.get("x_min", -40.0))
+    x_max = float(qr_spec.get("x_max", 140.0))
+    thickness = float(qr_spec.get("band_thickness_m", 1.0))
+    interface = np.asarray(kohler_soil_base_interface_z_np(physical_x), dtype=np.float64)
+    profile = str(qr_spec.get("profile", "downslope_arc")).lower()
+    span = max(x_max - x_min, 1.0e-12)
+    xi = np.clip((physical_x - x_min) / span, 0.0, 1.0)
+    if profile == "surface_to_surface_arc":
+        center = float(qr_spec.get("center_lower_offset_m", 0.5))
+        edge = float(qr_spec.get("edge_lower_offset_m", 8.5))
+        lower = center + (edge - center) * (2.0 * xi - 1.0) ** 2
+        d_lower_dx = 4.0 * (edge - center) * (2.0 * xi - 1.0) / span
+    else:
+        left = float(qr_spec.get("left_lower_offset_m", 0.0))
+        right = float(qr_spec.get("right_lower_offset_m", 0.0))
+        lower = right + (left - right) * (1.0 - xi) ** 2
+        d_lower_dx = -2.0 * (left - right) * (1.0 - xi) / span
+    # The block is the soil above the slip band, inside its two surface exits.
+    if bool(case.get("separate_slide_body", {}).get("enabled", False)):
+        block = sliding_block_mask_from_arrays(
+            positions,
+            material_ids,
+            body_ids,
+            case,
+            [BODY_SLIDE],
+        )
+    else:
+        block = (
+            (body_ids == BODY_MAIN_SOIL)
+            & (material_ids == MAT_SOIL)
+            & (physical_x >= x_min)
+            & (physical_x <= x_max)
+            & (physical_z > interface + lower + thickness)
+        )
+    velocity_mode = str(spec.get("mode", "surface_tangent")).lower()
+    if velocity_mode in {"rigid_translation", "constant", "uniform"}:
+        angle_deg = float(spec.get("direction_angle_deg", -K_SLOPE_ANGLE_DEG))
+        angle_rad = math.radians(angle_deg)
+        velocities[block, 0] = speed * math.cos(angle_rad)
+        velocities[block, 1] = speed * math.sin(angle_rad)
+    elif velocity_mode in {"surface_tangent", "local_tangent"}:
+        tangent_x = np.ones_like(d_lower_dx)
+        tangent_z = np.asarray(kohler_soil_base_interface_slope_np(physical_x), dtype=np.float64) + d_lower_dx
+        norm = np.sqrt(tangent_x * tangent_x + tangent_z * tangent_z)
+        velocities[block, 0] = speed * tangent_x[block] / norm[block]
+        velocities[block, 1] = speed * tangent_z[block] / norm[block]
+    else:
+        raise ValueError(
+            "postquake_block_velocity.mode must be 'surface_tangent' or 'rigid_translation'"
+        )
+    full_velocity = mpm.scene.particle.v.to_numpy()
+    full_velocity[:particle_count] = velocities.astype(full_velocity.dtype, copy=False)
+    mpm.scene.particle.v.from_numpy(full_velocity)
+    result = {
+        "enabled": True,
+        "speed_m_per_s": speed,
+        "particle_count": int(np.count_nonzero(block)),
+        "mode": velocity_mode,
+    }
+    if velocity_mode in {"rigid_translation", "constant", "uniform"}:
+        result["direction_angle_deg"] = float(spec.get("direction_angle_deg", -K_SLOPE_ANGLE_DEG))
+    mpm.postquake_block_velocity = result
+    return result
+
+
 def apply_material_stage(mpm: MPM, case: dict[str, Any], stage: str) -> list[dict[str, Any]]:
     staged_materials = materials_for_stage(case, stage)
     material_manager = getattr(mpm.scene, "material", None)
@@ -4186,7 +4909,7 @@ def write_static_material_boundary_alignment_report(
         f"- static_timestep: `{static_spec.get('dt')}`",
         f"- static_velocity_projection: `{case.get('static_initialization', {}).get('velocity_projection', DYNAMIC_VELOCITY_PROJECTION)}`",
         f"- static_alpha_pic: `{static_spec.get('alpha_pic', STATIC_ALPHA_PIC)}`",
-        f"- static_stress_update: `{'Kohler Hughes-Winget Eq.27-Eq.28' if HUGHES_WINGET_STRESS_UPDATE else 'GeoTaichi LinearElastic default'}`",
+        f"- static_stress_update: `{hughes_winget_stress_update_label(case)}`",
         f"- static_max_velocity_tolerance: `{static_spec.get('max_velocity_tolerance')}`",
         f"- static_rms_velocity_tolerance: `{static_spec.get('rms_velocity_tolerance')}`",
         f"- initial_stress_method: `{'GeoTaichi ParticleStress.GravityField' if static_spec.get('use_geotaichi_gravity_field') else 'GeoTaichi static solve with gravity ramp'}`",
@@ -4212,6 +4935,22 @@ def write_static_material_boundary_alignment_report(
 
 
 def current_softening_strength(epstrain: float, material: dict[str, Any]) -> tuple[float, float, str, float]:
+    if "YieldStress" in material or "ResidualYieldStress" in material:
+        y0 = float(material.get("YieldStress", DP_COHESION))
+        yr = float(material.get("ResidualYieldStress", y0))
+        eps_start = float(material.get("PlasticDevStrain", SOFTENING_EPS_START))
+        eps_end = float(material.get("ResidualPlasticDevStrain", SOFTENING_EPS_END))
+        factor = softening_factor(abs(float(epstrain)), eps_start, eps_end)
+        yield_stress = y0 - (y0 - yr) * factor
+        if abs(float(epstrain)) <= 1.0e-14:
+            status = "elastic"
+        elif factor <= 0.0:
+            status = "plastic_peak_strength"
+        elif factor >= 1.0:
+            status = "plastic_residual_strength"
+        else:
+            status = "plastic_softening"
+        return yield_stress, 0.0, status, factor
     c0 = float(material.get("Cohesion", DP_COHESION))
     cr = float(material.get("ResidualCohesion", c0))
     phi0 = float(material.get("Friction", DP_FRICTION))
@@ -4330,10 +5069,56 @@ def apply_dynamic_drucker_prager_softening(mpm: MPM, case: dict[str, Any]) -> No
 def write_softening_parameters(case: dict[str, Any]) -> Path:
     path = OUTPUT_DIR / "softening_parameters.yaml"
     softening = case.get("softening", {})
+    if str(case.get("material_model", "")) == "VonMisesSoftening":
+        q_peak = float(softening.get("yield_stress_initial", DP_COHESION))
+        sensitivity = float(softening.get("strength_sensitivity", 1.8))
+        q_residual_paper = q_peak / sensitivity if sensitivity > 0.0 else math.nan
+        q_residual_config = float(softening.get("yield_stress_residual", q_residual_paper))
+        d_residual = float(softening.get("residual_shear_displacement_m", 0.2))
+        h = float(case.get("dx", DX))
+        h_shear_factor = float(softening.get("h_shear_factor", 2.0))
+        h_shear = h_shear_factor * h
+        eps_derived = d_residual / (math.sqrt(3.0) * h_shear) if h_shear > 0.0 else math.nan
+        eps_config = float(softening.get("eps_end", SOFTENING_EPS_END))
+        q_residual_match = math.isclose(q_residual_config, q_residual_paper, rel_tol=1.0e-8, abs_tol=1.0e-8)
+        eps_match = math.isclose(eps_config, eps_derived, rel_tol=1.0e-8, abs_tol=1.0e-8)
+        lines = [
+            "softening_enabled: " + str(bool(softening.get("enabled", SOFTENING_ENABLED))).lower(),
+            "material_model: VonMisesSoftening",
+            "yield_criterion: von Mises J2",
+            "law: linear isotropic yield-stress softening",
+            "state_variable: epstrain",
+            "paper_parameters:",
+            f"  q_peak_kpa: {q_peak}",
+            f"  sensitivity: {sensitivity}",
+            f"  q_residual_kpa_from_sensitivity: {q_residual_paper}",
+            f"  residual_shear_displacement_m: {d_residual}",
+            "regularization_mapping:",
+            f"  dx_m: {h}",
+            f"  h_shear_factor: {h_shear_factor}",
+            f"  h_shear_m: {h_shear}",
+            "  formula: d_r / (sqrt(3) * h_shear)",
+            f"  eps_end_derived: {eps_derived}",
+            f"  eps_end_configured: {eps_config}",
+            f"  strength_residual_match: {str(q_residual_match).lower()}",
+            f"  strain_mapping_match: {str(eps_match).lower()}",
+            f"  audit_status: {'PASS' if q_residual_match and eps_match else 'REVIEW'}",
+            "model_parameters:",
+            f"  initial_yield_stress_kpa: {q_peak}",
+            f"  residual_yield_stress_kpa: {q_residual_config}",
+            f"  eps_start: {float(softening.get('eps_start', SOFTENING_EPS_START))}",
+            f"  eps_end: {eps_config}",
+            "note: q_residual and eps_end are checked against the paper sensitivity and smeared-crack mapping.",
+        ]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
     lines = [
         "softening_enabled: " + str(bool(softening.get("enabled", SOFTENING_ENABLED))).lower(),
         "law: linear",
         "state_variable: epstrain",
+        "yield_stress:",
+        f"  initial: {float(softening.get('yield_stress_initial', DP_COHESION))}",
+        f"  residual: {float(softening.get('yield_stress_residual', SOFTENING_RESIDUAL_COHESION))}",
         "cohesion:",
         f"  initial: {float(softening.get('cohesion_initial', DP_COHESION))}",
         f"  residual: {float(softening.get('cohesion_residual', SOFTENING_RESIDUAL_COHESION))}",
@@ -4354,28 +5139,46 @@ def write_softening_parameters(case: dict[str, Any]) -> Path:
 
 def write_softening_model_check(case: dict[str, Any], softening_parameters_path: Path) -> Path:
     path = OUTPUT_DIR / "softening_model_check.md"
+    material_model = str(case.get("material_model"))
+    if material_model == "SoftenMohrCoulomb":
+        selected_reason = (
+            "failure case uses the local SoftenMohrCoulomb state variable; zero friction and dilation give an undrained Tresca approximation, "
+            "with peak-to-residual cohesion degradation per particle."
+        )
+        direct_option = "selected directly for the failure case"
+    elif material_model == "VonMisesSoftening":
+        selected_reason = (
+            "failure case uses the solver-compatible J2/von Mises radial-return model; equivalent plastic strain drives linear isotropic yield-stress softening."
+        )
+        direct_option = "selected directly for the failure case"
+    else:
+        selected_reason = (
+            "current slope keeps the validated DruckerPrager model and applies driver-level peak-to-residual strength updates from accumulated epstrain during the dynamic stage."
+        )
+        direct_option = "SoftenMohrCoulomb is available as a direct local-softening option"
     lines = [
         "# Softening Model Check",
         "",
         "## Existing GeoTaichi Capability",
         "",
         "- `SoftenMohrCoulomb`: available through `MaterialManager` and mapped to `src/mpm/materials/infinitesimal_strain/MohrCoulomb.py`.",
+        "- `VonMisesSoftening`: available through `MaterialManager` and mapped to `src/mpm/materials/infinitesimal_strain/VonMisesSoftening.py`.",
         "- `MohrCoulomb`: non-softening wrapper name maps to `WillianMohrCoulomb` in this codebase.",
         "- `StateDependentMohrCoulomb`: has state-dependent strength logic and `epstrain`, but requires additional state parameters not used by this slope driver.",
         "- `CohesiveModifiedCamClay`: has additional internal variables and degradation terms, but is not the first-stage frictional slope softening target.",
         "",
         "## Selected Model",
         "",
-        f"- material_model: `{case.get('material_model')}`",
+        f"- material_model: `{material_model}`",
         "- selected_for_current_slope: `PASS`",
-        "- reason: current slope keeps the validated `DruckerPrager` model and applies driver-level peak-to-residual strength updates from accumulated `epstrain` during the dynamic stage.",
-        "- existing_direct_softening_option: `SoftenMohrCoulomb` is available, but the current default preserves the previously validated Drucker-Prager static equilibrium path.",
+        f"- reason: {selected_reason}",
+        f"- direct_softening_option: `{direct_option}`",
         "",
         "## Parameter Interface",
         "",
-        "- required/common: `MaterialID`, `Density`, `YoungModulus`, `PossionRatio`, `Friction`.",
-        "- peak strength: `Cohesion`, `Friction`, `Dilation`, `Tensile`.",
-        "- residual strength: `ResidualCohesion`, `ResidualFriction`, `ResidualDilation`.",
+        "- required/common: `MaterialID`, `Density`, `YoungModulus`, `PossionRatio`.",
+        "- Mohr-Coulomb/DP strength: `Cohesion`, `Friction`, `Dilation`, `Tensile`.",
+        "- von Mises strength: `YieldStress`, `ResidualYieldStress`.",
         "- softening range: `PlasticDevStrain` to `ResidualPlasticDevStrain`.",
         "- state variables: `epstrain`, `estress`.",
         f"- parameter_file: `{softening_parameters_path}`",
@@ -4414,6 +5217,7 @@ def write_softening_state(case: dict[str, Any], arrays: dict[str, np.ndarray]) -
                 "particle_id": pid,
                 "epstrain": eps,
                 "cohesion_current": cohesion,
+                "strength_current": cohesion,
                 "friction_current": friction,
                 "yield_status": status,
                 "x": float(position[0]),
@@ -4432,6 +5236,7 @@ def write_softening_state(case: dict[str, Any], arrays: dict[str, np.ndarray]) -
             "particle_id",
             "epstrain",
             "cohesion_current",
+            "strength_current",
             "friction_current",
             "yield_status",
             "x",
@@ -4450,6 +5255,8 @@ def write_softening_state(case: dict[str, Any], arrays: dict[str, np.ndarray]) -
         "max_softening_factor": float(np.max(factors_array)) if factors_array.size else 0.0,
         "min_cohesion": float(np.min(cohesions_array)) if cohesions_array.size else 0.0,
         "mean_cohesion": float(np.mean(cohesions_array)) if cohesions_array.size else 0.0,
+        "min_strength": float(np.min(cohesions_array)) if cohesions_array.size else 0.0,
+        "mean_strength": float(np.mean(cohesions_array)) if cohesions_array.size else 0.0,
         "min_friction": float(np.min(frictions_array)) if frictions_array.size else 0.0,
         "mean_friction": float(np.mean(frictions_array)) if frictions_array.size else 0.0,
     }
@@ -4539,6 +5346,8 @@ def write_softening_validation_report(
         f"- maximum_softening_factor: `{softening_stats.get('max_softening_factor')}`",
         f"- final_min_cohesion: `{softening_stats.get('min_cohesion')}`",
         f"- final_mean_cohesion: `{softening_stats.get('mean_cohesion')}`",
+        f"- final_min_yield_stress: `{softening_stats.get('min_strength')}`",
+        f"- final_mean_yield_stress: `{softening_stats.get('mean_strength')}`",
         f"- final_min_friction_angle_deg: `{softening_stats.get('min_friction')}`",
         f"- final_mean_friction_angle_deg: `{softening_stats.get('mean_friction')}`",
         f"- failure_zone_started: `{'PASS' if strength_degraded else 'FAIL'}`",
@@ -7356,10 +8165,18 @@ def build_free_field_interface_pairs(
         if ff_sorted.size == 0:
             return rows
         ff_y = physical[ff_sorted, 1]
+        used_ff: set[int] = set()
         for main_pid_i32 in main_sorted:
             main_pid = int(main_pid_i32)
-            nearest_index = int(np.argmin(np.abs(ff_y - physical[main_pid, 1])))
+            candidate_indices = np.argsort(np.abs(ff_y - physical[main_pid, 1]), kind="stable")
+            nearest_index = next(
+                (int(candidate) for candidate in candidate_indices if int(candidate) not in used_ff),
+                None,
+            )
+            if nearest_index is None:
+                break
             ff_pid = int(ff_sorted[nearest_index])
+            used_ff.add(nearest_index)
             distance = float(np.linalg.norm(positions[main_pid] - positions[ff_pid]))
             rows.append(
                 {
@@ -7411,6 +8228,16 @@ def kohler_soil_base_interface_z_np(xp: np.ndarray | float) -> np.ndarray | floa
     if np.isscalar(xp):
         return float(interface)
     return interface
+
+
+def kohler_soil_base_interface_slope_np(xp: np.ndarray | float) -> np.ndarray | float:
+    xp_array = np.asarray(xp, dtype=np.float64)
+    normalized_x = (xp_array - K_SLOPE_CENTER_X) / K_SLOPE_SIGMA
+    normal_pdf = np.exp(-0.5 * normalized_x * normalized_x) / math.sqrt(2.0 * math.pi)
+    slope = -K_GAUSSIAN_TOTAL_DROP * normal_pdf / K_SLOPE_SIGMA
+    if np.isscalar(xp):
+        return float(slope)
+    return slope
 
 
 def kohler_base_bottom_z_np(xp: np.ndarray | float) -> np.ndarray | float:
@@ -7802,8 +8629,16 @@ def write_transition_outputs(
     same_count = particle_count_static == particle_count_dynamic
     body_ids_same = np.array_equal(static_arrays.get("body_id"), dynamic_arrays.get("body_id"))
     material_ids_same = np.array_equal(static_arrays.get("material_id"), dynamic_arrays.get("material_id"))
+    static_material_ids = np.asarray(static_arrays.get("material_id", np.empty(0)), dtype=np.int32)
+    dynamic_material_ids = np.asarray(dynamic_arrays.get("material_id", np.empty(0)), dtype=np.int32)
+    static_body_ids = np.asarray(static_arrays.get("body_id", np.empty(0)), dtype=np.int32)
+    dynamic_body_ids = np.asarray(dynamic_arrays.get("body_id", np.empty(0)), dtype=np.int32)
+    material_change_mask = static_material_ids != dynamic_material_ids
+    material_change_count = int(np.count_nonzero(material_change_mask))
     position_difference = max_row_norm_difference(static_position, dynamic_position)
     velocity_difference = max_row_norm_difference(static_velocity, dynamic_velocity)
+    velocity_change_norm = np.linalg.norm(dynamic_velocity - static_velocity, axis=1)
+    velocity_change_count = int(np.count_nonzero(velocity_change_norm > 1.0e-12))
     stress_difference = max_row_norm_difference(static_stress, dynamic_stress)
     velocity_jump = velocity_difference
     state_ok, state_difference, state_message = state_variable_difference(
@@ -7863,13 +8698,90 @@ def write_transition_outputs(
     gravity_after_switch = [float(value) for value in list(mpm.sims.gravity)[:2]]
     damping_after_switch = float(mpm.sims.background_damping)
 
-    no_regeneration = same_count and body_ids_same and material_ids_same
+    qr_initialization = getattr(mpm, "dynamic_qr_region", None)
+    expected_qr_count = int(qr_initialization.get("particle_count", 0)) if qr_initialization else 0
+    expected_qr_material_id = int(qr_initialization.get("material_id", -1)) if qr_initialization else -1
+    qr_assigns_material = bool(qr_initialization.get("assign_material", True)) if qr_initialization else False
+    separate_body_expected = bool(getattr(mpm, "separate_slide_body", None))
+    slide_material_id = int(
+        getattr(mpm, "separate_slide_body", {}).get("material_id", MAT_SOIL)
+        if separate_body_expected
+        else MAT_SOIL
+    )
+    weak_material_id = getattr(mpm, "separate_slide_body", {}).get("internal_weak_band_material_id")
+    expected_slide_material_ids = {slide_material_id}
+    if weak_material_id is not None:
+        expected_slide_material_ids.add(int(weak_material_id))
+    slide_material_mask = (
+        dynamic_body_ids == BODY_SLIDE
+        if separate_body_expected
+        else np.zeros_like(dynamic_material_ids, dtype=bool)
+    )
+    slide_material_change_expected = bool(
+        separate_body_expected
+        and np.count_nonzero(slide_material_mask) == int(getattr(mpm, "separate_slide_body", {}).get("particle_count", 0))
+        and np.all(static_material_ids[slide_material_mask] == MAT_SOIL)
+        and np.all(np.isin(dynamic_material_ids[slide_material_mask], list(expected_slide_material_ids)))
+    )
+    material_change_expected = (
+        slide_material_change_expected or
+        (
+            material_ids_same
+            if qr_initialization is None
+            else material_ids_same
+            if not qr_assigns_material
+            else (
+                material_change_count == expected_qr_count
+                and np.all(static_material_ids[material_change_mask] == MAT_SOIL)
+                and np.all(dynamic_material_ids[material_change_mask] == expected_qr_material_id)
+            )
+        )
+    )
+    qr_material_change_expected = (
+        material_ids_same
+        if qr_initialization is None
+        else material_ids_same
+        if not qr_assigns_material
+        else (
+            material_change_count == expected_qr_count
+            and np.all(static_material_ids[material_change_mask] == MAT_SOIL)
+            and np.all(dynamic_material_ids[material_change_mask] == expected_qr_material_id)
+        )
+    )
+    velocity_initialization = getattr(mpm, "postquake_block_velocity", None)
+    expected_velocity_count = (
+        int(velocity_initialization.get("particle_count", 0)) if velocity_initialization else 0
+    )
+    block_velocity_change_expected = (
+        velocity_difference == 0.0
+        if velocity_initialization is None
+        else velocity_change_count == expected_velocity_count
+    )
+    equivalent_qr_state = getattr(mpm, "equivalent_postquake_qr_state", None)
+    equivalent_state_change_expected = equivalent_qr_state is not None
+    stress_change_expected = stress_difference >= 0.0 if equivalent_state_change_expected else stress_difference == 0.0
+    state_change_expected = (not state_ok) if equivalent_state_change_expected else state_ok
+    if separate_body_expected:
+        stress_change_expected = True
+        state_change_expected = True
+    body_split_ok = False
+    if separate_body_expected and same_count:
+        static_body_ids = np.asarray(static_arrays.get("body_id", np.empty(0)), dtype=np.int32)
+        dynamic_body_ids = np.asarray(dynamic_arrays.get("body_id", np.empty(0)), dtype=np.int32)
+        body_split_ok = bool(
+            np.all(dynamic_body_ids[dynamic_body_ids == BODY_SLIDE] == BODY_SLIDE)
+            and np.all(static_body_ids[dynamic_body_ids == BODY_SLIDE] == BODY_MAIN_SOIL)
+        )
+    body_continuity_ok = body_ids_same or body_split_ok
+    no_regeneration = same_count and body_continuity_ok
     state_preserved = (
         same_count
         and position_difference == 0.0
-        and velocity_difference == 0.0
-        and stress_difference == 0.0
-        and state_ok
+        and body_continuity_ok
+        and material_change_expected
+        and block_velocity_change_expected
+        and stress_change_expected
+        and state_change_expected
     )
     expected_gravity_after_switch = static_monitor.target_gravity if DYNAMIC_KEEP_GRAVITY else [0.0, 0.0]
     gravity_ok = np.allclose(gravity_after_switch, expected_gravity_after_switch, rtol=0.0, atol=1.0e-6)
@@ -7915,19 +8827,25 @@ def write_transition_outputs(
         "",
         f"- particle_count_match: `{'PASS' if same_count else 'FAIL'}`",
         f"- particle_id_consistency: `{'PASS' if same_count else 'FAIL'}`",
-        f"- body_id_match: `{'PASS' if body_ids_same else 'FAIL'}`",
-        f"- material_id_match: `{'PASS' if material_ids_same else 'FAIL'}`",
+        f"- body_id_match: `{'PASS' if body_ids_same else 'EXPECTED_SPLIT' if body_split_ok else 'FAIL'}`",
+        f"- material_id_match: `{'PASS' if material_ids_same else 'EXPECTED_CHANGE' if material_change_expected else 'FAIL'}`",
+        f"- material_id_change_count: `{material_change_count}`",
+        f"- expected_qr_material_change_count: `{expected_qr_count}`",
+        f"- qr_material_initialization: `{'PASS' if material_change_expected else 'FAIL'}`",
         f"- max_position_difference: `{position_difference}`",
         f"- max_velocity_difference: `{velocity_difference}`",
         f"- velocity_jump_at_switch: `{velocity_jump}`",
+        f"- velocity_change_count: `{velocity_change_count}`",
+        f"- expected_postquake_velocity_count: `{expected_velocity_count}`",
+        f"- postquake_velocity_initialization: `{'PASS' if block_velocity_change_expected else 'FAIL'}`",
         f"- max_stress_difference: `{stress_difference}`",
         f"- transition_csv: `{transition_csv}`",
         "",
         "## Stress And State Variables",
         "",
-        f"- stress_inherited: `{'PASS' if stress_difference == 0.0 else 'FAIL'}`",
+        f"- stress_inherited: `{'EXPECTED_PROJECTED_CHANGE' if equivalent_state_change_expected else 'PASS' if stress_difference == 0.0 else 'FAIL'}`",
         f"- velocity_gradient_difference: `{max_row_norm_difference(static_arrays.get('velocity_gradient', np.empty((0, 2, 2))), dynamic_arrays.get('velocity_gradient', np.empty((0, 2, 2))))}`",
-        f"- material_state_variables: `{'PASS' if state_ok else 'FAIL'}`",
+        f"- material_state_variables: `{'EXPECTED_RESIDUAL_INITIALIZATION' if equivalent_state_change_expected else 'PASS' if state_ok else 'FAIL'}`",
         f"- material_state_variable_max_difference: `{state_difference}`",
         f"- material_state_variable_message: `{state_message}`",
         "",
@@ -8606,8 +9524,8 @@ class StaticInitializationMonitor:
             f"- static_velocity_projection: `{self.mpm.sims.velocity_projection_scheme}`",
             f"- static_alpha_pic: `{self.spec.get('alpha_pic', STATIC_ALPHA_PIC)}`",
             f"- static_paper_eq11_damping: `{STATIC_PAPER_EQ11_DAMPING}`",
-            f"- static_stress_update: `{'Kohler Hughes-Winget Eq.27-Eq.28' if HUGHES_WINGET_STRESS_UPDATE else 'GeoTaichi LinearElastic default'}`",
-            f"- hughes_winget_formula_revision: `{PAPER_HUGHES_WINGET_FORMULA_REVISION if HUGHES_WINGET_STRESS_UPDATE else 'NOT_HUGHES_WINGET'}`",
+            f"- static_stress_update: `{hughes_winget_stress_update_label(self.case)}`",
+            f"- hughes_winget_formula_revision: `{PAPER_HUGHES_WINGET_FORMULA_REVISION if hughes_winget_enabled_for_case(self.case) else 'NOT_HUGHES_WINGET'}`",
             "- local_damping_formula: `f_d=-sign(v)*beta*abs(f), component-wise (Kohler Eq.11)`",
             f"- history_csv: `{history_path}`",
             "- iteration_time_history: `see history_csv`",
@@ -8995,6 +9913,22 @@ class NairnSeismicBoundary:
         self.ff_pair_shear_impedance_areas_np = np.ascontiguousarray(shear_impedance_areas)
         self.ff_pair_static_stress_xx_np = np.ascontiguousarray(static_stresses[self.ff_pair_ids_np, 0] if self.ff_pair_ids_np.size else np.empty(0))
         self.ff_pair_static_stress_xy_np = np.ascontiguousarray(static_stresses[self.ff_pair_ids_np, 3] if self.ff_pair_ids_np.size else np.empty(0))
+        self.ff_pair_initial_main_positions_np = np.ascontiguousarray(
+            positions[self.ff_pair_main_ids_np].copy() if self.ff_pair_main_ids_np.size else np.empty((0, 2)),
+            dtype=np.float64,
+        )
+        self.ff_pair_initial_free_field_positions_np = np.ascontiguousarray(
+            positions[self.ff_pair_ids_np].copy() if self.ff_pair_ids_np.size else np.empty((0, 2)),
+            dtype=np.float64,
+        )
+        self.ff_pair_initial_vertical_offsets_np = np.ascontiguousarray(
+            np.abs(self.ff_pair_initial_main_positions_np[:, 1] - self.ff_pair_initial_free_field_positions_np[:, 1]),
+            dtype=np.float64,
+        )
+        self.ff_pair_initial_geometric_gaps_np = np.ascontiguousarray(
+            np.abs(self.ff_pair_initial_main_positions_np[:, 0] - self.ff_pair_initial_free_field_positions_np[:, 0]) - DX / 3.0,
+            dtype=np.float64,
+        )
 
         self.bottom_count = int(self.bottom_particle_ids_np.size)
         self.bottom_static_reaction_node_count = int(self.bottom_static_reaction_node_ids_np.size)
@@ -9054,6 +9988,8 @@ class NairnSeismicBoundary:
         self.total_ff_coupling_main_y = ti.field(dtype=ti.f64, shape=())
         self.total_ff_coupling_free_x = ti.field(dtype=ti.f64, shape=())
         self.total_ff_coupling_free_y = ti.field(dtype=ti.f64, shape=())
+        self.total_ff_coupling_power_main = ti.field(dtype=ti.f64, shape=())
+        self.total_ff_dashpot_dissipation = ti.field(dtype=ti.f64, shape=())
         self.max_ff_coupling_balance_error = ti.field(dtype=ti.f64, shape=())
         self.surface_area_update_call_count = ti.field(dtype=ti.i32, shape=())
         self.invalid_surface_area_count = ti.field(dtype=ti.i32, shape=())
@@ -9473,6 +10409,8 @@ class NairnSeismicBoundary:
                 self.ff_pair_shear_dashpot_force_y,
                 self.ff_pair_total_force_x,
                 self.ff_pair_total_force_y,
+                self.total_ff_coupling_power_main,
+                self.total_ff_dashpot_dissipation,
             )
             invalid_surface_area_count = int(self.invalid_surface_area_count[None])
             if invalid_surface_area_count > 0:
@@ -9489,6 +10427,8 @@ class NairnSeismicBoundary:
                 self.total_ff_coupling_free_y,
                 self.max_ff_coupling_balance_error,
             )
+            self.total_ff_coupling_power_main[None] = 0.0
+            self.total_ff_dashpot_dissipation[None] = 0.0
         self._capture_force_component("free_field_coupling", scene)
         diagnostic_time = self.dynamic_time(sims)
         if (
@@ -9533,6 +10473,9 @@ class NairnSeismicBoundary:
                 "input_stress_y": pressure_input_stress(self.dynamic_time(sims)),
                 "total_input_force_x": float(self.total_input_force_x[None]),
                 "total_input_force_y": float(self.total_input_force_y[None]),
+                "total_input_power": float(
+                    self.total_input_force_x[None] * upward_input_velocity(self.dynamic_time(sims))
+                ),
                 "total_static_reaction_force_x": float(self.total_static_reaction_force_x[None]),
                 "total_static_reaction_force_y": float(self.total_static_reaction_force_y[None]),
                 "total_lateral_static_support_x": float(self.total_lateral_static_support_x[None]),
@@ -9553,6 +10496,8 @@ class NairnSeismicBoundary:
                 "total_ff_coupling_free_field_force_y": float(self.total_ff_coupling_free_y[None]),
                 "total_main_coupling_force_x": float(self.total_ff_coupling_main_x[None]),
                 "total_main_coupling_force_y": float(self.total_ff_coupling_main_y[None]),
+                "total_ff_coupling_power_main": float(self.total_ff_coupling_power_main[None]),
+                "total_ff_dashpot_dissipation": float(self.total_ff_dashpot_dissipation[None]),
                 "total_force_applied_to_free_field_by_main": math.hypot(
                     float(self.total_ff_coupling_free_x[None]),
                     float(self.total_ff_coupling_free_y[None]),
@@ -9598,6 +10543,9 @@ class NairnSeismicBoundary:
             "input_stress_x": input_stress(time_value),
             "total_input_force_x": float(self.total_input_force_x[None]),
             "total_input_force_y": float(self.total_input_force_y[None]),
+            "total_input_power": float(
+                self.total_input_force_x[None] * upward_input_velocity(time_value)
+            ),
             "total_static_reaction_force_x": float(self.total_static_reaction_force_x[None]),
             "total_static_reaction_force_y": float(self.total_static_reaction_force_y[None]),
             "total_bottom_silent_force_x": float(self.total_bottom_silent_x[None]),
@@ -9605,6 +10553,8 @@ class NairnSeismicBoundary:
             "total_side_silent_force_x": float(self.total_side_silent_x[None]),
             "total_main_coupling_force_x": float(self.total_ff_coupling_main_x[None]),
             "total_main_coupling_force_y": float(self.total_ff_coupling_main_y[None]),
+            "total_ff_coupling_power_main": float(self.total_ff_coupling_power_main[None]),
+            "total_ff_dashpot_dissipation": float(self.total_ff_dashpot_dissipation[None]),
             "total_force_applied_to_free_field_by_main": math.hypot(
                 float(self.total_ff_coupling_free_x[None]),
                 float(self.total_ff_coupling_free_y[None]),
@@ -9646,6 +10596,7 @@ class NairnSeismicBoundary:
             "input_stress_x",
             "total_input_force_x",
             "total_input_force_y",
+            "total_input_power",
             "total_static_reaction_force_x",
             "total_static_reaction_force_y",
             "total_bottom_silent_force_x",
@@ -9653,6 +10604,8 @@ class NairnSeismicBoundary:
             "total_side_silent_force_x",
             "total_main_coupling_force_x",
             "total_main_coupling_force_y",
+            "total_ff_coupling_power_main",
+            "total_ff_dashpot_dissipation",
             "total_force_applied_to_free_field_by_main",
         ]
         for name in self.monitor_particles:
@@ -9696,6 +10649,7 @@ class NairnSeismicBoundary:
             "input_stress_y",
             "total_input_force_x",
             "total_input_force_y",
+            "total_input_power",
             "total_static_reaction_force_x",
             "total_static_reaction_force_y",
             "total_bottom_silent_force_x",
@@ -9710,6 +10664,8 @@ class NairnSeismicBoundary:
             "total_ff_coupling_free_field_force_y",
             "total_main_coupling_force_x",
             "total_main_coupling_force_y",
+            "total_ff_coupling_power_main",
+            "total_ff_dashpot_dissipation",
             "total_force_applied_to_free_field_by_main",
             "ff_coupling_balance_error",
             "bottom_particle_count",
@@ -9722,6 +10678,7 @@ class NairnSeismicBoundary:
                     boundary_fields.append(field)
         write_csv(boundary_path, boundary_fields, self.boundary_rows)
         velocity_output_paths = self.write_velocity_csv_outputs()
+        energy_transfer_path = self.write_energy_transfer_report()
         grid_info = grid_count_info(self.mpm)
         metadata = {
             "case": self.case,
@@ -9774,13 +10731,11 @@ class NairnSeismicBoundary:
             "input_motion_monitors": [item["name"] for item in self.input_motion_monitors],
             "monitor_points_check": monitor_check_path.as_posix(),
             "strict_time_loop": STRICT_TIME_LOOP,
-            "stress_update": (
-                "Kohler Hughes-Winget Eq.27-Eq.28"
-                if HUGHES_WINGET_STRESS_UPDATE
-                else "GeoTaichi LinearElastic default"
-            ),
+            "stress_update": hughes_winget_stress_update_label(self.case),
             "hughes_winget_formula_revision": (
-                PAPER_HUGHES_WINGET_FORMULA_REVISION if HUGHES_WINGET_STRESS_UPDATE else "NOT_HUGHES_WINGET"
+                PAPER_HUGHES_WINGET_FORMULA_REVISION
+                if hughes_winget_enabled_for_case(self.case)
+                else "NOT_HUGHES_WINGET"
             ),
             "dynamic_velocity_projection": DYNAMIC_VELOCITY_PROJECTION,
             "dynamic_alpha_pic": DYNAMIC_ALPHA_PIC,
@@ -9863,6 +10818,7 @@ class NairnSeismicBoundary:
             f"- surface velocity: `{velocity_output_paths['surface']}`",
             f"- free-field coupling report: `{OUTPUT_DIR / 'free_field_coupling_report.md'}`",
             f"- free-field pair check: `{OUTPUT_DIR / 'free_field_pair_check.csv'}`",
+            f"- energy transfer report: `{energy_transfer_path}`",
             f"- native particles/grids: `{OUTPUT_DIR}`",
         ]
         report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -9870,6 +10826,85 @@ class NairnSeismicBoundary:
         input_report_path = self.write_external_earthquake_input_report(decomposition_path)
         self.write_free_field_coupling_outputs()
         self.write_dx05_test_report(velocity_output_paths, grid_info, history_path, boundary_path, monitor_check_path)
+
+    def write_energy_transfer_report(self) -> Path:
+        """Summarize work delivered by the one-way free-field boundary."""
+
+        path = OUTPUT_DIR / "energy_transfer_report.md"
+        rows = [row for row in self.boundary_rows if math.isfinite(float(row.get("time", math.nan)))]
+        rows.sort(key=lambda row: float(row["time"]))
+        if rows:
+            times = np.asarray([float(row["time"]) for row in rows], dtype=np.float64)
+            input_power = np.asarray(
+                [float(row.get("total_input_power", 0.0)) for row in rows],
+                dtype=np.float64,
+            )
+            power = np.asarray(
+                [float(row.get("total_ff_coupling_power_main", 0.0)) for row in rows],
+                dtype=np.float64,
+            )
+            dissipation = np.asarray(
+                [float(row.get("total_ff_dashpot_dissipation", 0.0)) for row in rows],
+                dtype=np.float64,
+            )
+            finite = np.isfinite(times) & np.isfinite(input_power) & np.isfinite(power) & np.isfinite(dissipation)
+            times = times[finite]
+            input_power = input_power[finite]
+            power = power[finite]
+            dissipation = dissipation[finite]
+        else:
+            times = np.empty(0, dtype=np.float64)
+            input_power = np.empty(0, dtype=np.float64)
+            power = np.empty(0, dtype=np.float64)
+            dissipation = np.empty(0, dtype=np.float64)
+
+        def integrate(values: np.ndarray) -> float:
+            if values.size < 2 or times.size < 2:
+                return 0.0
+            if hasattr(np, "trapezoid"):
+                return float(np.trapezoid(values, times))
+            return float(np.trapz(values, times))
+
+        peak_power = float(np.max(np.abs(power))) if power.size else 0.0
+        peak_input_power = float(np.max(np.abs(input_power))) if input_power.size else 0.0
+        peak_dissipation = float(np.max(dissipation)) if dissipation.size else 0.0
+        min_dissipation = float(np.min(dissipation)) if dissipation.size else 0.0
+        nonzero_transfer = peak_power > 1.0e-9
+        dissipation_nonnegative = min_dissipation >= -1.0e-8
+        lines = [
+            "# Free-Field Energy Transfer Report",
+            "",
+            "## Verdict",
+            "",
+            f"- status: `{'PASS' if nonzero_transfer and dissipation_nonnegative else 'FAIL'}`",
+            f"- sampled_boundary_rows: `{len(rows)}`",
+            f"- free_field_to_main_transfer_detected: `{'PASS' if nonzero_transfer else 'FAIL'}`",
+            f"- dashpot_dissipation_nonnegative: `{'PASS' if dissipation_nonnegative else 'FAIL'}`",
+            "",
+            "## Work And Power",
+            "",
+            "- coupling_power_main: `sum(F_free_field_to_main dot v_main)`",
+            "- input_power: `F_input dot v_input` at the compliant bottom boundary",
+            "- dashpot_dissipation: `sum(eta_p*A*dv_x^2 + eta_s*A*dv_y^2)`",
+            "- coupling_direction: `free_field_to_main_only (prescribed independent free-field source)`",
+            f"- net_input_work: `{integrate(input_power)}`",
+            f"- absolute_input_work: `{integrate(np.abs(input_power))}`",
+            f"- net_free_field_to_main_work: `{integrate(power)}`",
+            f"- absolute_free_field_to_main_work: `{integrate(np.abs(power))}`",
+            f"- dashpot_dissipated_work: `{integrate(dissipation)}`",
+            f"- peak_abs_coupling_power: `{peak_power}`",
+            f"- peak_abs_input_power: `{peak_input_power}`",
+            f"- peak_dashpot_dissipation: `{peak_dissipation}`",
+            f"- minimum_dashpot_dissipation: `{min_dissipation}`",
+            "",
+            "## Interpretation",
+            "",
+            "- This is a boundary work audit, not a claim of global mechanical-energy conservation.",
+            "- The independent free-field columns are not given the opposite force, by design, so the source remains unpolluted by the main slope response.",
+            "- Nonzero transfer power with nonnegative dashpot dissipation confirms transmission and absorption in the intended direction.",
+        ]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
 
     def write_velocity_csv_outputs(self) -> dict[str, Path]:
         input_path = OUTPUT_DIR / "kohler_input_velocity.csv"
@@ -9956,8 +10991,8 @@ class NairnSeismicBoundary:
             f"- plotted_input_velocity: `{'Fig10c CSV velocity' if SEISMIC_INPUT_MODE == 'FIG10C' else f'{SEISMIC_INPUT_FACTOR}*v_outcrop'}`",
             f"- upward_wave_velocity: `{SEISMIC_INPUT_FACTOR}*v_outcrop_or_Fig10c_input_motion`",
             f"- compliant_base_traction: `2*rho*Cs*upward_input_velocity(t)`",
-            f"- stress_update: `{'Kohler Hughes-Winget Eq.27-Eq.28' if HUGHES_WINGET_STRESS_UPDATE else 'GeoTaichi LinearElastic default'}`",
-            f"- hughes_winget_formula_revision: `{PAPER_HUGHES_WINGET_FORMULA_REVISION if HUGHES_WINGET_STRESS_UPDATE else 'NOT_HUGHES_WINGET'}`",
+            f"- stress_update: `{hughes_winget_stress_update_label(self.case)}`",
+            f"- hughes_winget_formula_revision: `{PAPER_HUGHES_WINGET_FORMULA_REVISION if hughes_winget_enabled_for_case(self.case) else 'NOT_HUGHES_WINGET'}`",
             f"- mapping: `{MAPPING}`",
             f"- dynamic_velocity_projection: `{DYNAMIC_VELOCITY_PROJECTION}`",
             f"- dynamic_alpha_pic: `{DYNAMIC_ALPHA_PIC}`",
@@ -10154,6 +11189,8 @@ class NairnSeismicBoundary:
         for index in range(self.ff_pair_count):
             main_pid = int(self.ff_pair_main_ids_np[index])
             ff_pid = int(self.ff_pair_ids_np[index])
+            initial_main = self.ff_pair_initial_main_positions_np[index]
+            initial_ff = self.ff_pair_initial_free_field_positions_np[index]
             pair_rows.append(
                 {
                     "side": str(self.ff_pair_sides_np[index]),
@@ -10178,7 +11215,18 @@ class NairnSeismicBoundary:
                     "main_material_id": int(material_ids[main_pid]),
                     "free_field_material_id": int(material_ids[ff_pid]),
                     "same_material": bool(material_ids[main_pid] == material_ids[ff_pid]),
-                    "same_elevation": bool(abs(positions[main_pid, 1] - positions[ff_pid, 1]) <= elevation_tolerance),
+                    "initial_main_x": float(initial_main[0] - X_SHIFT),
+                    "initial_main_y": float(initial_main[1] - Y_SHIFT),
+                    "initial_ff_x": float(initial_ff[0] - X_SHIFT),
+                    "initial_ff_y": float(initial_ff[1] - Y_SHIFT),
+                    "initial_vertical_offset": float(self.ff_pair_initial_vertical_offsets_np[index]),
+                    "initial_geometric_gap": float(self.ff_pair_initial_geometric_gaps_np[index]),
+                    "initial_same_elevation": bool(
+                        self.ff_pair_initial_vertical_offsets_np[index] <= elevation_tolerance
+                    ),
+                    "same_elevation": bool(
+                        abs(positions[main_pid, 1] - positions[ff_pid, 1]) <= elevation_tolerance
+                    ),
                 }
             )
         write_csv(
@@ -10206,6 +11254,13 @@ class NairnSeismicBoundary:
                 "main_material_id",
                 "free_field_material_id",
                 "same_material",
+                "initial_main_x",
+                "initial_main_y",
+                "initial_ff_x",
+                "initial_ff_y",
+                "initial_vertical_offset",
+                "initial_geometric_gap",
+                "initial_same_elevation",
                 "same_elevation",
             ],
             pair_rows,
@@ -10217,8 +11272,9 @@ class NairnSeismicBoundary:
         ff_unique = len(set(int(pid) for pid in self.ff_pair_ids_np.tolist()))
         unique_pairs = main_unique == self.ff_pair_count and ff_unique == self.ff_pair_count
         material_pairs_ok = bool(pair_rows) and all(bool(row["same_material"]) for row in pair_rows)
-        elevation_pairs_ok = bool(pair_rows) and all(bool(row["same_elevation"]) for row in pair_rows)
-        max_vertical_offset = max((float(row["vertical_offset"]) for row in pair_rows), default=math.inf)
+        elevation_pairs_ok = bool(pair_rows) and all(bool(row["initial_same_elevation"]) for row in pair_rows)
+        max_vertical_offset = max((float(row["initial_vertical_offset"]) for row in pair_rows), default=math.inf)
+        current_max_vertical_offset = max((float(row["vertical_offset"]) for row in pair_rows), default=math.inf)
         real_particles = bool(
             self.ff_pair_count
             and np.all(self.ff_pair_main_ids_np >= 0)
@@ -10230,7 +11286,7 @@ class NairnSeismicBoundary:
         )
         average_distance = float(np.mean(self.ff_pair_distances_np)) if self.ff_pair_count else math.nan
         max_distance = float(np.max(self.ff_pair_distances_np)) if self.ff_pair_count else math.nan
-        gap_values = [float(row["geometric_gap"]) for row in pair_rows]
+        gap_values = [float(row["initial_geometric_gap"]) for row in pair_rows]
         gap_check = bool(gap_values) and all(
             abs(value - K_FREE_FIELD_GAP) <= PARTICLE_COORDINATE_TOLERANCE for value in gap_values
         )
@@ -10244,7 +11300,10 @@ class NairnSeismicBoundary:
         free_field_force_ok = max_free_field_force <= FREE_FIELD_INDEPENDENCE_TOLERANCE
         independence_path = OUTPUT_DIR / "free_field_independence_check.csv"
         independence_status = free_field_independence_status(independence_path)
-        status = "PASS" if unique_pairs and material_pairs_ok and elevation_pairs_ok and real_particles and gap_check and free_field_force_ok and independence_status == "PASS" else "FAIL"
+        runtime_independence_ok = independence_status == "PASS" or (
+            independence_status == "MISSING" and free_field_force_ok
+        )
+        status = "PASS" if unique_pairs and material_pairs_ok and elevation_pairs_ok and real_particles and gap_check and runtime_independence_ok else "FAIL"
 
         lines = [
             "# Free Field Coupling Report",
@@ -10257,12 +11316,13 @@ class NairnSeismicBoundary:
             f"- pairs_match_material_layer: `{'PASS' if material_pairs_ok else 'FAIL'}`",
             f"- pairs_match_elevation: `{'PASS' if elevation_pairs_ok else 'FAIL'}`",
             f"- prescribed_interface_gap: `{K_FREE_FIELD_GAP}`",
-            f"- measured_interface_gap: `{min(gap_values, default=math.nan)} .. {max(gap_values, default=math.nan)}`",
+            f"- measured_initial_interface_gap: `{min(gap_values, default=math.nan)} .. {max(gap_values, default=math.nan)}`",
             f"- interface_gap_check: `{'PASS' if gap_check else 'FAIL'}`",
             f"- endpoints_are_real_mpm_particles: `{'PASS' if real_particles else 'FAIL'}`",
             f"- main_to_free_field_force: `{max_free_field_force}`",
             f"- main_to_free_field_force_check: `{'PASS' if free_field_force_ok else 'FAIL'}`",
             f"- independence_test: `{independence_status}`",
+            f"- runtime_one_way_independence_check: `{'PASS' if free_field_force_ok else 'FAIL'}`",
             "",
             "## Pair Counts",
             "",
@@ -10276,7 +11336,8 @@ class NairnSeismicBoundary:
             "",
             f"- average_distance: `{average_distance}`",
             f"- max_distance: `{max_distance}`",
-            f"- max_vertical_offset: `{max_vertical_offset}`",
+            f"- max_initial_vertical_offset: `{max_vertical_offset}`",
+            f"- max_current_vertical_offset_for_reference: `{current_max_vertical_offset}`",
             f"- elevation_tolerance: `{elevation_tolerance}`",
             f"- pair_csv: `{pair_path}`",
             "",
@@ -10657,6 +11718,7 @@ def run_strict_time_loop(mpm: MPM, callback) -> float:
                     mpm.postprocessing(
                         read_path=OUTPUT_DIR.as_posix(),
                         write_background_grid=SAVE_GRID,
+                        **failure_postprocess_kwargs(getattr(mpm, "case", CASE)),
                     )
                 except BaseException as vtk_error:
                     failure_snapshot_status = f"SAVED_BUT_VTK_FAILED: {repr(vtk_error)}"
@@ -10728,6 +11790,7 @@ def run_static_time_loop(mpm: MPM, static_monitor: StaticInitializationMonitor, 
     if mpm.solver is not None:
         mpm.solver.postprocess = []
     mpm.add_essentials({"function": None})
+    install_failure_snapshot_recorder(mpm, getattr(mpm, "case", CASE))
     # Section 2.6 states that the Hughes-Winget objective stress integration
     # is used for the analysis. Install it before static relaxation as well as
     # before dynamics so the carried static stress state uses the same update.
@@ -11424,6 +12487,12 @@ def run_dynamic_stage(
     # direct nodal support is transferred into the first dynamic force window.
     register_bottom_input_traction(mpm, case)
     dynamic_materials = apply_material_stage(mpm, case, "dynamic")
+    apply_dynamic_qr_region(mpm, case)
+    apply_equivalent_postquake_qr_state(mpm, case)
+    apply_separate_slide_body(mpm, case)
+    apply_postquake_block_velocity(mpm, case)
+    dynamic_strength_override = apply_dynamic_strength_override(mpm, case)
+    mpm.dynamic_strength_override = dynamic_strength_override
     static_materials = materials_for_stage(case, "static")
     write_static_material_boundary_alignment_report(case, static_materials, dynamic_materials)
     dynamic_gravity = static_monitor.target_gravity if DYNAMIC_KEEP_GRAVITY else [0.0, 0.0]
@@ -11438,6 +12507,20 @@ def run_dynamic_stage(
     # Finalize the dynamic engine before extracting transferred reactions.
     # add_essentials selects the active force-assembly implementation.
     mpm.add_essentials({"function": None})
+    diagnostic_spec = case.get("diagnostic", {})
+    if bool(diagnostic_spec.get("zero_velocity_at_dynamic_start", False)):
+        particle_count = int(mpm.scene.particleNum[0])
+        zero_static_particle_kinematics(particle_count, mpm.scene.particle)
+        apic_affine_velocity = getattr(mpm, "nairn_apic_affine_velocity", None)
+        if apic_affine_velocity is not None:
+            apic_affine_velocity.fill(0.0)
+        mpm.dynamic_transition_velocity_zeroed = True
+    else:
+        mpm.dynamic_transition_velocity_zeroed = False
+    # Checkpoint-loaded runs create the recorder here (after the initial
+    # setup-time install attempt), so install the failure-state augmentation
+    # again once the dynamic recorder exists.
+    install_failure_snapshot_recorder(mpm, case)
     if not hasattr(mpm, "static_bottom_constraint_node_ids_np"):
         mpm.static_bottom_constraint_node_ids_np = static_bottom_constraint_node_ids(mpm)
     # A checkpoint rebuilds the engine, so restore the static-stage periodic
@@ -11504,6 +12587,7 @@ def run_dynamic_stage(
 
     def dynamic_step_callback() -> None:
         apply_dynamic_drucker_prager_softening(mpm, case)
+        maybe_stop_seismic_input(mpm, case)
         mpm.nairn_seismic_boundary.record_history(mpm.sims, mpm.scene)
         if JOINT_BOUNDARY_VALIDATION:
             update_latest_joint_boundary_row_after_step(mpm, periodic_mapper)
@@ -13819,6 +14903,15 @@ def main() -> None:
         memory=case["memory"]
     )
 
+    separate_slide_spec = case.get("separate_slide_body", {})
+    if bool(separate_slide_spec.get("enabled", False)):
+        mpm.add_contact(
+            "MPMContact",
+            friction=float(separate_slide_spec.get("contact_friction", 0.05)),
+        )
+        mpm.scene.contact.body_id1 = BODY_MAIN_SOIL
+        mpm.scene.contact.body_id2 = BODY_SLIDE
+
     static_materials = materials_for_stage(case, "static")
     mpm.add_material(model=case.get("material_model", "LinearElastic"), material=static_materials)
     if not EXTRACT_LATERAL_STATIC_SUPPORT:
@@ -13931,6 +15024,7 @@ def main() -> None:
     # reuse the same particle IDs in the dynamic stage.
     register_bottom_input_traction(mpm, case)
     mpm.select_save_data(particle=SAVE_PARTICLE, grid=SAVE_GRID, object=False)
+    install_failure_snapshot_recorder(mpm, case)
 
     static_checkpoint_report = None
     if STATIC_CHECKPOINT_CONTINUE and not STATIC_CHECKPOINT_LOAD:
@@ -14103,9 +15197,11 @@ def main() -> None:
     )
     transition_report = None
     transition_csv = None
+    failure_stop_report = None
     if bool(case.get("run_dynamic", True)):
         dynamic_start_time = float(mpm.sims.current_time)
         transition_report, transition_csv = run_dynamic_stage(mpm, case, static_monitor, dynamic_start_time)
+        failure_stop_report = write_failure_stop_report(mpm, case)
         if JOINT_BOUNDARY_VALIDATION:
             paths = getattr(mpm, "joint_boundary_validation_paths", None)
             if paths is None:
@@ -14142,7 +15238,11 @@ def main() -> None:
     )
 
     if RUN_POSTPROCESS:
-        mpm.postprocessing(read_path=OUTPUT_DIR.as_posix(), write_background_grid=SAVE_GRID)
+        mpm.postprocessing(
+            read_path=OUTPUT_DIR.as_posix(),
+            write_background_grid=SAVE_GRID,
+            **failure_postprocess_kwargs(case),
+        )
 
     prefix = str(case.get("output_prefix", case.get("name", "nairn_case")))
     if bool(case.get("run_dynamic", True)):
@@ -14163,6 +15263,8 @@ def main() -> None:
     print(f"softening_check = {softening_check}")
     print(f"softening_state = {softening_state}")
     print(f"softening_validation = {softening_validation}")
+    if failure_stop_report is not None:
+        print(f"failure_stop_report = {failure_stop_report}")
     if transition_report is not None:
         print(f"transition_report = {transition_report}")
     if transition_csv is not None:

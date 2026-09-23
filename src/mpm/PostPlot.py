@@ -36,7 +36,7 @@ def write_vtk_file(sims: Simulation, start_file, end_file, read_path, write_path
         position = DictIO.GetEssential(particle_info, "position")
         posx = np.ascontiguousarray(position[:, 0])
         posy = np.ascontiguousarray(position[:, 1])
-        posz = np.zeros(position.shape[0])
+        posz = np.zeros(position.shape[0], dtype=posx.dtype)
         if sims.dimension == 3:
             posz = np.ascontiguousarray(position[:, 2])
 
@@ -50,7 +50,7 @@ def write_vtk_file(sims: Simulation, start_file, end_file, read_path, write_path
             disp = position - position0
             dispx = np.ascontiguousarray(disp[:, 0])
             dispy = np.ascontiguousarray(disp[:, 1])
-            dispz = np.zeros(disp.shape[0])
+            dispz = np.zeros(disp.shape[0], dtype=dispx.dtype)
             if sims.dimension == 3:
                 dispz = np.ascontiguousarray(disp[:, 2])
             displacement = (dispx, dispy, dispz)
@@ -59,7 +59,7 @@ def write_vtk_file(sims: Simulation, start_file, end_file, read_path, write_path
             vel = DictIO.GetEssential(particle_info, "velocity")
             velx = np.ascontiguousarray(vel[:, 0])
             vely = np.ascontiguousarray(vel[:, 1])
-            velz = np.zeros(vel.shape[0])
+            velz = np.zeros(vel.shape[0], dtype=velx.dtype)
             if sims.dimension == 3:
                 velz = np.ascontiguousarray(vel[:, 2])
             velocity = (velx, vely, velz)
@@ -97,7 +97,7 @@ def write_vtk_file(sims: Simulation, start_file, end_file, read_path, write_path
             normal = DictIO.GetEssential(particle_info, "normal")
             xnorm = np.ascontiguousarray(normal[:, 0])
             ynorm = np.ascontiguousarray(normal[:, 1])
-            znorm = np.zeros(normal.shape[0])
+            znorm = np.zeros(normal.shape[0], dtype=xnorm.dtype)
             if sims.dimension == 3:
                 znorm = np.ascontiguousarray(normal[:, 2])
             data.update({"normal": (xnorm, ynorm, znorm)})
@@ -105,7 +105,7 @@ def write_vtk_file(sims: Simulation, start_file, end_file, read_path, write_path
             external_force = DictIO.GetEssential(particle_info, "external_force")
             xforce = np.ascontiguousarray(external_force[:, 0])
             yforce = np.ascontiguousarray(external_force[:, 1])
-            zforce = np.zeros(external_force.shape[0])
+            zforce = np.zeros(external_force.shape[0], dtype=xforce.dtype)
             if sims.dimension == 3:
                 zforce = np.ascontiguousarray(external_force[:, 2])
             data.update({"external_force": (xforce, yforce, zforce)})
@@ -121,7 +121,7 @@ def write_vtk_file(sims: Simulation, start_file, end_file, read_path, write_path
             coords = DictIO.GetEssential(grid_info, "coords")
             posx = np.unique(np.ascontiguousarray(coords[:, 0]))
             posy = np.unique(np.ascontiguousarray(coords[:, 1]))
-            posz = np.zeros(1)
+            posz = np.zeros(1, dtype=posx.dtype)
             if sims.dimension == 3:
                 posz = np.unique(np.ascontiguousarray(coords[:, 2]))
 
@@ -144,4 +144,3 @@ def write_vtk_file(sims: Simulation, start_file, end_file, read_path, write_path
                 grid_data.update({"normal": (xnorm, ynorm, znorm)})
 
             gridToVTK(write_path+f'/GraphicMPMGrid{printNum:06d}', posx, posy, posz, pointData=grid_data)
-            
